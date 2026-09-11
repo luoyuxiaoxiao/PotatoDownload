@@ -69,6 +69,13 @@ namespace PotatoVN.App.PluginBase
         {
             try
             {
+                if (!_data.AutoDownload)
+                {
+                    _hostApi.Info(Microsoft.UI.Xaml.Controls.InfoBarSeverity.Informational,
+                        "PotatoDownload", $"收到推送（自动下载已关闭）: {request.Title}");
+                    return;
+                }
+
                 _hostApi.Info(Microsoft.UI.Xaml.Controls.InfoBarSeverity.Informational,
                     "PotatoDownload", $"开始处理推送: {request.Title}");
 
@@ -76,8 +83,10 @@ namespace PotatoVN.App.PluginBase
                 var library = new LibraryService(_hostApi);
                 await library.EnsurePlaceholderAsync(request);
 
-                // 2. 下载目录：插件数据目录下
-                var downloadDir = System.IO.Path.Combine(_hostApi.GetPluginPath(), "downloads");
+                // 2. 下载目录：设置项或插件数据目录下
+                var downloadDir = string.IsNullOrWhiteSpace(_data.DownloadPath)
+                    ? System.IO.Path.Combine(_hostApi.GetPluginPath(), "downloads")
+                    : _data.DownloadPath;
                 System.IO.Directory.CreateDirectory(downloadDir);
                 var packPath = System.IO.Path.Combine(downloadDir, request.FileName);
 

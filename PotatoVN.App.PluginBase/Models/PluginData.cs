@@ -10,6 +10,9 @@ namespace PotatoVN.App.PluginBase.Models;
 /// </summary>
 public partial class PluginData : ObservableRecipient
 {
-    //标记为ObservableProperty的变量会自动生成一个大写开头的属性，如这里会生成一个TestBool属性，之后应该永远使用这个属性而不是字段本身
-    [ObservableProperty] private bool _testBool; 
+    /// <summary>下载目录（解压后的游戏存放位置）。为空时使用插件目录下的 downloads。</summary>
+    [ObservableProperty] private string _downloadPath = string.Empty;
+
+    /// <summary>收到推送后是否自动开始下载（关闭时仅通知，不自动处理）。</summary>
+    [ObservableProperty] private bool _autoDownload = true;
 }

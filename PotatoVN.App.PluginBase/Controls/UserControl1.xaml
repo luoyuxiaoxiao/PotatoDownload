@@ -12,15 +12,21 @@
                            Margin="{ThemeResource SmallBottomMargin}">
         <prefabs:Panel>
             <StackPanel Spacing="10" Padding="20">
-                <TextBlock FontSize="24" Text="大家好，我是插件！" />
-                <TextBlock Text="这是一个来自外部DLL的用户控件。" />
-                <Button x:Name="Button" Content="Hello World!" Click="ButtonBase_OnClick"/>
+                <TextBlock FontSize="24" Text="PotatoDownload" />
+                <TextBlock Text="从 shionlib 自动推送到 PotatoVN 进行下载、解压和刮削。" />
             </StackPanel>
         </prefabs:Panel>
-        
+
         <prefabs:Panel>
-            <prefabs:Setting Title="推荐用这个控件来当作设置控件" Description="这是该设置的描述">
-                <ToggleSwitch IsOn="{x:Bind _data.TestBool, Mode=TwoWay}"/>
+            <prefabs:Setting Title="下载目录" Description="解压后的游戏存放位置，留空则使用插件目录下的 downloads">
+                <TextBox x:Name="DownloadPathBox" Text="{x:Bind _data.DownloadPath, Mode=TwoWay}"
+                         PlaceholderText="例如 D:\Games" />
+            </prefabs:Setting>
+        </prefabs:Panel>
+
+        <prefabs:Panel>
+            <prefabs:Setting Title="自动下载" Description="收到推送后自动开始下载；关闭时仅提示收到推送">
+                <ToggleSwitch IsOn="{x:Bind _data.AutoDownload, Mode=TwoWay}"/>
             </prefabs:Setting>
         </prefabs:Panel>
     </prefabs:StdStackPanel>
