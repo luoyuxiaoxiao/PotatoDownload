@@ -65,12 +65,51 @@ namespace PotatoVN.App.PluginBase
             _ = _hostApi.SaveDataAsync(dataJson);
         }
 
-        private Task OnPushRequestReceived(InstallRequest request)
+        private async Task OnPushRequestReceived(InstallRequest request)
         {
-            // 下载/解压/刮削流程将在后续步骤实现
-            _hostApi.Info(Microsoft.UI.Xaml.Controls.InfoBarSeverity.Success,
-                "PotatoDownload", $"收到推送: {request.Title}");
-            return Task.CompletedTask;
+            try
+            {
+                _hostApi.Info(Microsoft.UI.Xaml.Controls.InfoBarSeverity.Informational,
+                    "PotatoDownload", $"开始处理推送: {request.Title}");
+
+                // 1. 创建带外部 ID 的占位游戏（用于精确匹配）
+                var library = new LibraryService(_hostApi);
+                await library.EnsurePlaceholderAsync(request);
+
+                // 2. 下载目录：插件数据目录下
+                var downloadDir = System.IO.Path.Combine(_hostApi.GetPluginPath(), "downloads");
+                System.IO.Directory.CreateDirectory(downloadDir);
+                var packPath = System.IO.Path.Combine(downloadDir, request.FileName);
+
+                // 3. 下载 + 校验
+                var download = new DownloadService();
+                await download.DownloadAsync(request, packPath,
+                    (current, total) => _hostApi.Log(Microsoft.UI.Xaml.Controls.InfoBarSeverity.Informational,
+                        $"PotatoDownload: 下载中 {current}/{total}"));
+                await DownloadService.VerifyChecksumAsync(request, packPath);
+
+                // 4. 解压
+                var gameDirName = UnpackService.ResolveGameDirectoryName(request, packPath);
+                var gamePath = System.IO.Path.Combine(downloadDir, gameDirName);
+                if (System.IO.Directory.Exists(gamePath))
+                    System.IO.Directory.Delete(gamePath, true);
+                System.IO.Directory.CreateDirectory(gamePath);
+                await UnpackService.UnpackAsync(request, packPath, gamePath);
+
+                // 5. 入库 + 刮削
+                await library.AddInstallationAsync(request, gamePath);
+
+                // 6. 清理压缩包
+                System.IO.File.Delete(packPath);
+
+                _hostApi.Info(Microsoft.UI.Xaml.Controls.InfoBarSeverity.Success,
+                    "PotatoDownload", $"完成: {request.Title}");
+            }
+            catch (Exception e)
+            {
+                _hostApi.Event(Microsoft.UI.Xaml.Controls.InfoBarSeverity.Error, "PotatoDownload",
+                    e, $"处理推送失败: {request.Title}");
+            }
         }
 
         protected Guid Id => Info.Id;
