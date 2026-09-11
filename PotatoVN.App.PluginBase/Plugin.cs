@@ -6,8 +6,8 @@ using GalgameManager.WinApp.Base.Contracts.PluginUi;
 using GalgameManager.WinApp.Base.Models;
 using PotatoVN.App.PluginBase.Helper;
 using PotatoVN.App.PluginBase.Models;
+using PotatoVN.App.PluginBase.Services;
 
-//todo: 请修改PotatoVN.App.PluginBase/PotatoVN.App.PluginBase.csproj中的AssemblyName
 namespace PotatoVN.App.PluginBase
 {
     public partial class Plugin : IPlugin, IPluginSetting
@@ -15,6 +15,7 @@ namespace PotatoVN.App.PluginBase
         public static IPotatoVnApi HostApi { get; private set; } = null!;
         private IPotatoVnApi _hostApi = null!;
         private PluginData _data = new ();
+        private PushService _pushService = null!;
         
         public PluginInfo Info { get; } = new()
         {
@@ -44,11 +45,16 @@ namespace PotatoVN.App.PluginBase
             }
             _data.PropertyChanged += (_, _) => SaveData(); // 当Observable属性变化时自动保存数据，对于普通属性请手动调用SaveData
             InitUi();
+
+            _pushService = new PushService(_hostApi);
+            _pushService.RequestReceived += OnPushRequestReceived;
+            _pushService.Start();
         }
         
         public Task OnUninstallAsync(bool deleteData, Action<TimeSpan> extendWaitHandler, CancellationToken cts)
         {
             if (cts.IsCancellationRequested) return Task.FromCanceled(cts);
+            _pushService?.Stop();
             ResourceLoader.Unload(); // 卸载XAML资源字典
             return Task.CompletedTask;
         }
@@ -57,6 +63,14 @@ namespace PotatoVN.App.PluginBase
         {
             var dataJson = System.Text.Json.JsonSerializer.Serialize(_data);
             _ = _hostApi.SaveDataAsync(dataJson);
+        }
+
+        private Task OnPushRequestReceived(InstallRequest request)
+        {
+            // 下载/解压/刮削流程将在后续步骤实现
+            _hostApi.Info(Microsoft.UI.Xaml.Controls.InfoBarSeverity.Success,
+                "PotatoDownload", $"收到推送: {request.Title}");
+            return Task.CompletedTask;
         }
 
         protected Guid Id => Info.Id;
