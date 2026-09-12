@@ -62,6 +62,42 @@ namespace PotatoVN.App.PluginBase
             _pushService = new PushService(_hostApi, DevReportInfo);
             _pushService.RequestReceived += OnPushRequestReceived;
             _pushService.Start();
+            ReportHostApiSurface();
+        }
+
+        /// <summary>开发期：探测宿主实际提供的插件 API 面并上报一次（宿主各版本差异很大）。</summary>
+        private void ReportHostApiSurface()
+        {
+            try
+            {
+                string[] probe =
+                [
+                    "GetGameByUid", "GetGameById", "AddVirtualGameAsync", "AddSourceAsync",
+                    "AddGameToSource", "SaveGameAsync", "InvokeOnMainThreadAsync",
+                    "GetAllGames", "AddVirtualGame", "AddGameInstallation",
+                    "RegisterSidebarButton", "GetMainWindow",
+                ];
+                var present = new System.Text.StringBuilder();
+                var missing = new System.Text.StringBuilder();
+                foreach (var name in probe)
+                {
+                    var found = false;
+                    foreach (var method in _hostApi.GetType().GetMethods())
+                    {
+                        if (method.Name == name)
+                        {
+                            found = true;
+                            break;
+                        }
+                    }
+                    (found ? present : missing).Append(name).Append(',');
+                }
+                _ = DevReportInfo(null, $"host api surface present=[{present}] missing=[{missing}]");
+            }
+            catch
+            {
+                // 探测失败无关紧要
+            }
         }
         
         public async Task OnUninstallAsync(bool deleteData, Action<TimeSpan> extendWaitHandler, CancellationToken cts)
