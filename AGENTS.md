@@ -56,9 +56,9 @@
 <!-- 架构、依赖、外部系统、为什么这么做。例：- 编译目标 net8.0-windows，原因：宿主 PotatoVN 限定 -->
 - 本插件目标：接收 Shionlib 推送（potato-vn://install 深链）→ 下载/校验 → 解压 → 刮削入库
 - Shionlib 推送协议（v1）：`potato-vn://install?v=1&provider=shionlib&resource_id&url&file_name&archive_format&size&checksum_algo(sha256|blake3)&checksum&expires_at&bgm_id&title[&vndb_id][&hikarinagi_id][&archive_password]`；Shionlib 前端目前只推 `reinamanager://`，需其配合加 PotatoVN 按钮（改 scheme 即可，参数兼容）
-- PotatoVN 已注册 `potato-vn://` scheme（manifest）；插件可订阅 `AppInstance.GetCurrent().Activated` 捕获协议激活（WinAppSDK API，插件可用）；`IPotatoVnApi.ActivationArgs` 只反映初始化时参数
+- PotatoVN 已注册 `potato-vn://` scheme（manifest）；插件通过订阅 `AppInstance.GetCurrent().Activated` 捕获协议激活（事件订阅安全做法见 Feedback 区）；`IPotatoVnApi.ActivationArgs` 虽随激活更新，但激活参数 COM 代理在回调结束后立即失效，插件轮询读不到
 - 插件不能调用主程序 `UnpackGameTask`（在主程序程序集）；解压需插件自引 SharpCompress/SevenZip
-- 精确刮削：构造 Galgame 设 `Ids[(int)RssType.Bangumi/Vndb/Hikarinagi]` → `AddVirtualGameAsync` 建占位 → `AddGameInstallation(path)` 关联路径（UID 精确命中）
+- **插件只能调用宿主稳定版（v1.10.2）已有的插件 API**（2026-09 用户实测 MissingMethodException）：dev 版新增的 GetGameByUid/GetGameById/AddVirtualGameAsync(Galgame)/AddSourceAsync/AddGameToSource/SaveGameAsync/InvokeOnMainThreadAsync 一律不能用；精确刮削流程：GetAllGames 按 Ids 手动查重 → AddVirtualGame(name) 建占位后补设 `game.Ids[(int)RssType.*]`（宿主同对象引用，立即生效）→ AddGameInstallation(path)；模型/枚举（Galgame.Ids、RssType 含 Hikarinagi、NameOnlyGameMatchException、GalgameUid）两版一致可用；Plugin.ReportHostApiSurface 启动时上报宿主 API 面（发布前随 DevReportInfo 一并移除）
 - 参考实现：ReinaManager `src-tauri/src/install/`（protocol/download/workflow），Shionlib `apps/frontend/components/game/download/helpers/reina.ts`
 - 下载架构：DownloadService 多线程分块（4 连接 × 4MB 块，Range 探测失败退化为单连接续传），.part + .part.watermark 断点续传；DownloadManager 串行队列 + ObservableCollection<DownloadTask> 供 UI 绑定
 - UI：侧边栏按钮"下载"→ ContentDialog 弹窗（DownloadProgressDialog，纯C#），无独立页面；设置页 UserControl1（纯C#，下载目录 + 自动下载开关）；主题资源查找走 Helper/PluginTheme
