@@ -70,6 +70,7 @@
 - 模板 csproj 无 ImplicitUsings，新 .cs 文件需手写 using System/IO/Linq/Net.Http 等
 - 带 BOM 的 .cs 文件 file_editor 会误判为二进制，用 PowerShell ReadAllText 确认内容
 - BLAKE3 用 Blake3.Managed NuGet（纯托管）；SharpCompress 用 0.50.4（0.38 有漏洞 NU1902）
+- **插件绝不能订阅宿主进程静态事件**（AppInstance.Activated 等）：事件委托锁定插件程序集 → 更新/卸载时 DLL 删除失败（UnauthorizedAccessException）。改用轮询 IPotatoVnApi.ActivationArgs（宿主每次激活更新该属性）；后台 Task 停止时必须 await 完成并清空事件委托
 
 ### References
 <!-- 外部资源指针。例：- 报错日志查 Grafana: grafana.internal/d/plugin-runtime -->
