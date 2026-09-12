@@ -19,14 +19,52 @@ public partial class Plugin : IGalgamePageLeftPanel, IGalgamePageRightPanel
         {
            Id = "potato-download",
            Text = "下载",
-           Placement = SidebarButtonPlacement.Menu, 
+           Placement = SidebarButtonPlacement.Menu,
            FluentGlyph = "&#xE896;",
         }, () =>
         {
             ShowDownloadDialog();
             return Task.CompletedTask;
         });
+        // 开发期测试入口：发布应用市场前必须移除
+        _hostApi.RegisterSidebarButton(new SidebarButtonInfo
+        {
+           Id = "potato-download-test-push",
+           Text = "推送测试",
+           Placement = SidebarButtonPlacement.Menu,
+           FluentGlyph = "&#xE71B;",
+        }, () =>
+        {
+            ShowTestPushDialog();
+            return Task.CompletedTask;
+        });
         _uiInit = true;
+    }
+
+    /// <summary>弹出推送测试面板（模态）。</summary>
+    private void ShowTestPushDialog()
+    {
+        _hostApi.InvokeOnMainThread(() =>
+        {
+            try
+            {
+                var window = _hostApi.GetMainWindow();
+                if (window is null) return;
+                var dialog = new ContentDialog
+                {
+                    XamlRoot = window.Content.XamlRoot,
+                    Title = "PotatoDownload 推送测试",
+                    Content = new TestPushDialog(DevReportInfo),
+                    CloseButtonText = "关闭",
+                    DefaultButton = ContentDialogButton.Close,
+                };
+                _ = dialog.ShowAsync();
+            }
+            catch (System.Exception e)
+            {
+                _ = DevReportInfo(e, "ShowTestPushDialog failed");
+            }
+        });
     }
 
     /// <summary>弹出下载进度弹窗（模态）。</summary>
