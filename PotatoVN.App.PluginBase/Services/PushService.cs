@@ -11,8 +11,8 @@ namespace PotatoVN.App.PluginBase.Services;
 
 /// <summary>
 /// 接收 Shionlib 推送（potato-vn://install 深链）的核心服务。
-/// 通过轮询 <see cref="IPotatoVnApi.ActivationArgs"/> 捕获协议激活（宿主每次激活都会更新该属性），
-/// 解析并校验 InstallRequest、去重后交给下载流程。
+/// 通过轮询 <see cref="AppInstance.GetActivatedEventArgs"/> 捕获协议激活（AppLifecycle 标准用法，
+/// 每次调用返回当前有效的激活参数，不会因宿主替换引用而失效）。
 /// 注意：不能订阅宿主进程静态事件（如 AppInstance.Activated），否则事件委托会锁定插件程序集，
 /// 导致插件更新/卸载时 DLL 无法删除。
 /// </summary>
@@ -76,7 +76,9 @@ public class PushService
         {
             try
             {
-                if (_hostApi.ActivationArgs is AppActivationArguments args)
+                // 每次轮询获取当前有效的激活参数（宿主替换旧引用后，旧对象访问会抛 COMException）
+                var args = AppInstance.GetCurrent().GetActivatedEventArgs();
+                if (args is not null)
                     HandleActivation(args);
             }
             catch (Exception e)
@@ -96,51 +98,51 @@ public class PushService
 
     private void HandleActivation(AppActivationArguments args)
     {
-        _hostApi.Log(InfoBarSeverity.Informational,
-            $"PotatoDownload: activation kind={args.Kind}");
-
-        Uri? uri = null;
-
-        switch (args.Kind)
-        {
-            case ExtendedActivationKind.Protocol:
-                if (args.Data is Windows.ApplicationModel.Activation.ProtocolActivatedEventArgs protocolArgs)
-                    uri = protocolArgs.Uri;
-                break;
-            case ExtendedActivationKind.Launch:
-                // MSI/侧载版通过命令行参数传递协议 URL（manifest: Parameters="/p &quot;%1&quot;"）
-                if (args.Data is Windows.ApplicationModel.Activation.ILaunchActivatedEventArgs launchArgs)
-                    uri = ExtractUriFromLaunchArguments(launchArgs.Arguments);
-                break;
-        }
-
-        if (uri is null)
-        {
-            _hostApi.Log(InfoBarSeverity.Informational,
-                "PotatoDownload: activation has no potato-vn URI");
-            return;
-        }
-        if (!string.Equals(uri.Scheme, InstallRequest.Scheme, StringComparison.OrdinalIgnoreCase))
-        {
-            _hostApi.Log(InfoBarSeverity.Informational,
-                $"PotatoDownload: activation scheme={uri.Scheme} (not potato-vn)");
-            return;
-        }
-
-        var uriString = uri.ToString();
-        var now = DateTime.UtcNow;
-
-        // 时间窗口去重：30 秒内同一 URI 只处理一次；窗口过后可再次触发（便于重复测试）
-        if (_seenUris.TryGetValue(uriString, out var lastSeen) && now - lastSeen < DedupeWindow)
-        {
-            _hostApi.Log(InfoBarSeverity.Informational,
-                $"PotatoDownload: duplicate push ignored within window ({uriString[..Math.Min(80, uriString.Length)]}...)");
-            return;
-        }
-        _seenUris[uriString] = now;
-
         try
         {
+            _hostApi.Log(InfoBarSeverity.Informational,
+                $"PotatoDownload: activation kind={args.Kind}");
+
+            Uri? uri = null;
+
+            switch (args.Kind)
+            {
+                case ExtendedActivationKind.Protocol:
+                    if (args.Data is Windows.ApplicationModel.Activation.ProtocolActivatedEventArgs protocolArgs)
+                        uri = protocolArgs.Uri;
+                    break;
+                case ExtendedActivationKind.Launch:
+                    // MSI/侧载版通过命令行参数传递协议 URL（manifest: Parameters="/p &quot;%1&quot;"）
+                    if (args.Data is Windows.ApplicationModel.Activation.ILaunchActivatedEventArgs launchArgs)
+                        uri = ExtractUriFromLaunchArguments(launchArgs.Arguments);
+                    break;
+            }
+
+            if (uri is null)
+            {
+                _hostApi.Log(InfoBarSeverity.Informational,
+                    "PotatoDownload: activation has no potato-vn URI");
+                return;
+            }
+            if (!string.Equals(uri.Scheme, InstallRequest.Scheme, StringComparison.OrdinalIgnoreCase))
+            {
+                _hostApi.Log(InfoBarSeverity.Informational,
+                    $"PotatoDownload: activation scheme={uri.Scheme} (not potato-vn)");
+                return;
+            }
+
+            var uriString = uri.ToString();
+            var now = DateTime.UtcNow;
+
+            // 时间窗口去重：30 秒内同一 URI 只处理一次；窗口过后可再次触发（便于重复测试）
+            if (_seenUris.TryGetValue(uriString, out var lastSeen) && now - lastSeen < DedupeWindow)
+            {
+                _hostApi.Log(InfoBarSeverity.Informational,
+                    $"PotatoDownload: duplicate push ignored within window ({uriString[..Math.Min(80, uriString.Length)]}...)");
+                return;
+            }
+            _seenUris[uriString] = now;
+
             var request = InstallRequest.Parse(uri);
             if (!_seenKeys.TryAdd(request.DeduplicationKey, 0))
             {
