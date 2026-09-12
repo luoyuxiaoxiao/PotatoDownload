@@ -25,22 +25,34 @@ public class LibraryService
     /// <summary>
     /// 创建带外部 ID（Bangumi/VNDB/Hikarinagi）的游戏占位，用于后续 UID 精确匹配。
     /// 若库中已存在同一游戏（任一外部 ID 命中）则直接返回。
+    /// 占位创建失败（如标题在信息源中查无此游戏）不阻断主流程，返回 null——
+    /// 后续 AddGameInstallation 会按目录名自行刮削匹配。
     /// </summary>
-    public async Task<Galgame> EnsurePlaceholderAsync(InstallRequest request)
+    public async Task<Galgame?> EnsurePlaceholderAsync(InstallRequest request)
     {
-        if (FindExisting(request) is { } existing)
-            return existing;
+        try
+        {
+            if (FindExisting(request) is { } existing)
+                return existing;
 
-        // 稳定版接口没有 AddVirtualGameAsync(Galgame)，先按名称建占位再补外部 ID。
-        // 返回的是宿主库中同一对象引用，设置 Ids 立即对宿主的 UID 匹配生效。
-        var game = await _hostApi.AddVirtualGame(request.Title, force: false, requireConfirm: false);
-        if (!string.IsNullOrEmpty(request.BgmId))
-            game.Ids[(int)RssType.Bangumi] = request.BgmId;
-        if (!string.IsNullOrEmpty(request.VndbId))
-            game.Ids[(int)RssType.Vndb] = request.VndbId;
-        if (!string.IsNullOrEmpty(request.HikarinagiId))
-            game.Ids[(int)RssType.Hikarinagi] = request.HikarinagiId;
-        return game;
+            // 稳定版接口没有 AddVirtualGameAsync(Galgame)，先按名称建占位再补外部 ID。
+            // 返回的是宿主库中同一对象引用，设置 Ids 立即对宿主的 UID 匹配生效。
+            // 注意：宿主的 AddVirtualGame 会按名称在线刮削，查无此游戏时抛 PvnException。
+            var game = await _hostApi.AddVirtualGame(request.Title, force: false, requireConfirm: false);
+            if (!string.IsNullOrEmpty(request.BgmId))
+                game.Ids[(int)RssType.Bangumi] = request.BgmId;
+            if (!string.IsNullOrEmpty(request.VndbId))
+                game.Ids[(int)RssType.Vndb] = request.VndbId;
+            if (!string.IsNullOrEmpty(request.HikarinagiId))
+                game.Ids[(int)RssType.Hikarinagi] = request.HikarinagiId;
+            return game;
+        }
+        catch (Exception e)
+        {
+            _hostApi.Log(Microsoft.UI.Xaml.Controls.InfoBarSeverity.Warning,
+                $"PotatoDownload: create placeholder skipped for '{request.Title}': {e.Message}");
+            return null;
+        }
     }
 
     /// <summary>将解压后的游戏目录关联到游戏库（宿主负责在线刮削并自动匹配占位）。</summary>

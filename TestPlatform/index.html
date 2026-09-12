@@ -104,14 +104,14 @@
       <div>
         <label>下载地址（url）*</label>
         <input id="f_url" spellcheck="false">
-        <div class="hint">默认指向内置测试载荷（test_game.zip，331 字节）。也可以自己托管 <code>payload\test_game.zip</code> 后把直链填进来——size 与校验和会自动按内置载荷重新计算。</div>
+        <div class="hint">默认指向内置测试载荷（363 字节 zip，内含 CLANNAD/game.exe）。也可以自己托管 <code>payload\test_game.zip</code> 后把直链填进来——size 与校验和会自动按内置载荷重新计算。</div>
       </div>
       <div>
         <label>title（标题）*</label>
-        <input id="f_title" value="PotatoDownload 测试游戏">
+        <input id="f_title" value="CLANNAD">
         <label>bgm_id *</label>
-        <input id="f_bgm" value="237">
-        <div class="hint">入库后会按该 Bangumi subject id 刮削元数据。</div>
+        <input id="f_bgm" value="13">
+        <div class="hint">入库后会按该 Bangumi subject id 刮削元数据。title 必须是信息源中能查到的真实游戏名，否则宿主建占位时会报错。</div>
       </div>
     </div>
     <div class="grid-3">
@@ -213,10 +213,10 @@
 
 // ===== 内置测试载荷（由 make-payload.ps1 生成，payload\test_game.zip）=====
 const PAYLOAD = {
-  base64url: "UEsDBBQAAAAIAAAAIVz11Vl9OAAAADYAAAAIAAAAZ2FtZS5leGULyC9JLMl3yS_Py8lPTFFwNXJVKEktLlFIrUhNLi1JTMpJ1VPwyy9RSFQoSk3MUUhPzE3V4-UCAFBLAwQUAAAACAAAACFcV3-pi0EAAABEAAAACgAAAHJlYWRtZS50eHQLyC9JLMl3yS_Py8lPTFFIzUvRLcnXBVIKJanFJQoFiZUgcR2F9NS81KLEktQUhaRKhRCgVEBOYklaflGuHi8XAFBLAQIUABQAAAAIAAAAIVz11Vl9OAAAADYAAAAIAAAAAAAAAAAAAAAAAAAAAABnYW1lLmV4ZVBLAQIUABQAAAAIAAAAIVxXf6mLQQAAAEQAAAAKAAAAAAAAAAAAAAAAAF4AAAByZWFkbWUudHh0UEsFBgAAAAACAAIAbgAAAMcAAAAAAA",
-  size: 331,
+  base64url: "UEsDBBQAAAAIAAAAIVz11Vl9OAAAADYAAAAQAAAAQ0xBTk5BRC9nYW1lLmV4ZQvIL0ksyXfJL8_LyU9MUXA1clUoSS0uUUitSE0uLUlMyknVU_DLL1FIVChKTcxRSE_MTdXj5QIAUEsDBBQAAAAIAAAAIVxXf6mLQQAAAEQAAAASAAAAQ0xBTk5BRC9yZWFkbWUudHh0C8gvSSzJd8kvz8vJT0xRSM1L0S3J1wVSCiWpxSUKBYmVIHEdhfTUvNSixJLUFIWkSoUQoFRATmJJWn5Rrh4vFwBQSwECFAAUAAAACAAAACFc9dVZfTgAAAA2AAAAEAAAAAAAAAAAAAAAAAAAAAAAQ0xBTk5BRC9nYW1lLmV4ZVBLAQIUABQAAAAIAAAAIVxXf6mLQQAAAEQAAAASAAAAAAAAAAAAAAAAAGYAAABDTEFOTkFEL3JlYWRtZS50eHRQSwUGAAAAAAIAAgB-AAAA1wAAAAAA",
+  size: 363,
   // 静态回退值；页面加载后会用 WebCrypto 重新计算校验
-  sha256: "bd3be3d638a19c8bd6302bbac0eec7b832834df88c2b715fdf7a2b1ce71cd780",
+  sha256: "0cdfccdc7ca8af40cc94c15f20de7d0e940f0ab731bed16cef34acafcdad4754",
 };
 
 const ENDPOINT = "https://httpbingo.org/base64/";
@@ -262,50 +262,52 @@ function buildInstallUrl(p) {
 }
 
 function validPresetParams(overrides = {}) {
+  // E2E 必须使用真实存在且可联网刮削的游戏（宿主按 title 在线刮削，查无此游戏会报错），
+  // 这里统一用 CLANNAD（bgm subject 13）；测试后请删除库中 CLANNAD 条目及其安装路径。
   return Object.assign({
     provider: "test", resourceId: "test-e2e-001",
-    url: defaultDownloadUrl(), fileName: "test_game.zip", archiveFormat: "zip",
+    url: defaultDownloadUrl(), fileName: "CLANNAD.zip", archiveFormat: "zip",
     size: PAYLOAD.size, checksumAlgo: "sha256", checksum: PAYLOAD.sha256,
-    expiresAt: EXPIRES_FAR, bgmId: "237", title: "PotatoDownload 测试游戏",
+    expiresAt: EXPIRES_FAR, bgmId: "13", title: "CLANNAD",
   }, overrides);
 }
 
 const PRESETS = [
   {
     cls: "ok", name: "完整流程（E2E）",
-    desc: "参数全部合法的推送。验证 下载 → sha256 校验 → 解压 → 入库 → 刮削 全链路。",
-    expect: "弹条提示「开始下载」→ 侧边栏「下载」弹窗可见任务推进 → 提示「完成」→ 游戏库新增条目（按 bgm_id 刮削）。",
+    desc: "以真实游戏条目 CLANNAD（bgm_id=13）推送。验证 下载 → sha256 校验 → 解压 → 入库 → 刮削 全链路。",
+    expect: "弹条提示「开始下载」→ 侧边栏「下载」弹窗可见任务推进 → 提示「完成」→ 库中 CLANNAD 条目新增安装路径。测试后请删除该条目。",
     params: () => validPresetParams(),
   },
   {
     cls: "warn", name: "已过期链接",
     desc: "expires_at 设为 2001 年。推送会被接受并入队，但下载阶段判定链接过期。",
     expect: "任务出现后失败；弹条/事件提示链接已过期。",
-    params: () => validPresetParams({ resourceId: "test-expired-001", expiresAt: 1000000000, title: "PotatoDownload 过期链接测试" }),
+    params: () => validPresetParams({ resourceId: "test-expired-001", expiresAt: 1000000000 }),
   },
   {
     cls: "warn", name: "校验和错误",
     desc: "checksum 故意填成全 0。文件能下载完，但 sha256 校验必然失败。",
     expect: "任务在「校验」阶段失败并提示校验不匹配。",
-    params: () => validPresetParams({ resourceId: "test-badsum-001", checksum: "0".repeat(64), title: "PotatoDownload 校验失败测试" }),
+    params: () => validPresetParams({ resourceId: "test-badsum-001", checksum: "0".repeat(64) }),
   },
   {
     cls: "bad", name: "内网地址（SSRF 防护）",
     desc: "url 指向 192.168 内网地址。插件应在解析阶段直接拒绝，不产生任何任务。",
     expect: "弹错误「无效的推送请求: 下载 URL 不允许指向本机或内网地址」；下载弹窗中无新任务。",
-    params: () => validPresetParams({ resourceId: "test-ssrf-001", url: "http://192.168.1.100/test_game.zip", title: "PotatoDownload SSRF 测试" }),
+    params: () => validPresetParams({ resourceId: "test-ssrf-001", url: "http://192.168.1.100/test_game.zip" }),
   },
   {
     cls: "bad", name: "缺少必填参数",
     desc: "故意去掉 size 参数。插件应在解析阶段拒绝并指出缺哪个参数。",
     expect: "弹错误「无效的推送请求: 缺少或无效参数: size」。",
-    params: () => validPresetParams({ resourceId: "test-missing-001", title: "PotatoDownload 缺参测试", omit: ["size"] }),
+    params: () => validPresetParams({ resourceId: "test-missing-001", omit: ["size"] }),
   },
   {
     cls: "ok", name: "仅提示（自动下载关闭时）",
     desc: "先在插件设置里把「自动下载」关掉，再发送本用例（参数与 E2E 相同）。",
     expect: "只弹「收到推送（自动下载已关闭）」，不进入下载。",
-    params: () => validPresetParams({ resourceId: "test-notify-001", title: "PotatoDownload 仅提示测试" }),
+    params: () => validPresetParams({ resourceId: "test-notify-001" }),
   },
 ];
 
