@@ -19,12 +19,13 @@ namespace PotatoVN.App.PluginBase.Services;
 public class PushService
 {
     private static readonly TimeSpan PollInterval = TimeSpan.FromSeconds(2);
+    private static readonly TimeSpan DedupeWindow = TimeSpan.FromSeconds(30);
 
     private readonly IPotatoVnApi _hostApi;
+    private readonly ConcurrentDictionary<string, DateTime> _seenUris = new();
     private readonly ConcurrentDictionary<string, byte> _seenKeys = new();
     private CancellationTokenSource? _cts;
     private Task? _pollTask;
-    private string? _lastProcessedUri;
 
     /// <summary>收到新推送请求时触发（已通过校验与去重）。</summary>
     public event Func<InstallRequest, Task>? RequestReceived;
@@ -43,6 +44,7 @@ public class PushService
         if (_cts is not null) return;
         _cts = new CancellationTokenSource();
         _pollTask = Task.Run(() => PollLoopAsync(_cts.Token));
+        _hostApi.Log(InfoBarSeverity.Informational, "PotatoDownload: PushService started");
     }
 
     /// <summary>
@@ -65,6 +67,7 @@ public class PushService
         _cts = null;
         _pollTask = null;
         RequestReceived = null; // 清空事件委托，确保不残留对插件方法的引用
+        _hostApi.Log(InfoBarSeverity.Informational, "PotatoDownload: PushService stopped");
     }
 
     private async Task PollLoopAsync(CancellationToken ct)
@@ -93,18 +96,48 @@ public class PushService
 
     private void HandleActivation(AppActivationArguments args)
     {
-        if (args.Kind != ExtendedActivationKind.Protocol) return;
-        if (args.Data is not Windows.ApplicationModel.Activation.ProtocolActivatedEventArgs protocolArgs)
-            return;
+        _hostApi.Log(InfoBarSeverity.Informational,
+            $"PotatoDownload: activation kind={args.Kind}");
 
-        var uri = protocolArgs.Uri;
+        Uri? uri = null;
+
+        switch (args.Kind)
+        {
+            case ExtendedActivationKind.Protocol:
+                if (args.Data is Windows.ApplicationModel.Activation.ProtocolActivatedEventArgs protocolArgs)
+                    uri = protocolArgs.Uri;
+                break;
+            case ExtendedActivationKind.Launch:
+                // MSI/侧载版通过命令行参数传递协议 URL（manifest: Parameters="/p &quot;%1&quot;"）
+                if (args.Data is Windows.ApplicationModel.Activation.ILaunchActivatedEventArgs launchArgs)
+                    uri = ExtractUriFromLaunchArguments(launchArgs.Arguments);
+                break;
+        }
+
+        if (uri is null)
+        {
+            _hostApi.Log(InfoBarSeverity.Informational,
+                "PotatoDownload: activation has no potato-vn URI");
+            return;
+        }
         if (!string.Equals(uri.Scheme, InstallRequest.Scheme, StringComparison.OrdinalIgnoreCase))
+        {
+            _hostApi.Log(InfoBarSeverity.Informational,
+                $"PotatoDownload: activation scheme={uri.Scheme} (not potato-vn)");
             return;
+        }
 
-        // 同一 URI 只处理一次（宿主每次激活都会更新 ActivationArgs，轮询会重复读到）
         var uriString = uri.ToString();
-        if (uriString == _lastProcessedUri) return;
-        _lastProcessedUri = uriString;
+        var now = DateTime.UtcNow;
+
+        // 时间窗口去重：30 秒内同一 URI 只处理一次；窗口过后可再次触发（便于重复测试）
+        if (_seenUris.TryGetValue(uriString, out var lastSeen) && now - lastSeen < DedupeWindow)
+        {
+            _hostApi.Log(InfoBarSeverity.Informational,
+                $"PotatoDownload: duplicate push ignored within window ({uriString[..Math.Min(80, uriString.Length)]}...)");
+            return;
+        }
+        _seenUris[uriString] = now;
 
         try
         {
@@ -128,5 +161,19 @@ public class PushService
         {
             _hostApi.DeveloperEvent(e: e, msg: "PotatoDownload: failed to handle activation");
         }
+    }
+
+    /// <summary>从启动命令行参数中提取协议 URL（形如 /p "potato-vn://install?..."）。</summary>
+    private static Uri? ExtractUriFromLaunchArguments(string? arguments)
+    {
+        if (string.IsNullOrWhiteSpace(arguments)) return null;
+        var index = arguments.IndexOf(InstallRequest.Scheme, StringComparison.OrdinalIgnoreCase);
+        if (index < 0) return null;
+        var start = arguments.IndexOf('"', index);
+        var end = start >= 0 ? arguments.IndexOf('"', start + 1) : -1;
+        var url = end > start
+            ? arguments.Substring(start + 1, end - start - 1)
+            : arguments[index..].Trim();
+        return Uri.TryCreate(url, UriKind.Absolute, out var uri) ? uri : null;
     }
 }
