@@ -73,8 +73,8 @@
 - 模板 csproj 无 ImplicitUsings，新 .cs 文件需手写 using System/IO/Linq/Net.Http 等
 - 带 BOM 的 .cs 文件 file_editor 会误判为二进制，用 PowerShell ReadAllText 确认内容
 - BLAKE3 用 Blake3.Managed NuGet（纯托管）；SharpCompress 用 0.50.4（0.38 有漏洞 NU1902）
-- **插件绝不能订阅宿主进程静态事件**（AppInstance.Activated 等）：事件委托锁定插件程序集 → 更新/卸载时 DLL 删除失败（UnauthorizedAccessException）。改用轮询 IPotatoVnApi.ActivationArgs（宿主每次激活更新该属性）；后台 Task 停止时必须 await 完成并清空事件委托
-- **热激活（应用在运行/托盘时点深链）单靠轮询 GetActivatedEventArgs 捕获不到**（2026-09 用户实测：只见初始 Launch 参数或 COM 失效 0x800706BA）→ PushService 双通道轮询：sdk GetActivatedEventArgs + host ActivationArgs（宿主在激活回调里同步替换该属性，检测到引用变化必须立即读取，COM 代理可能已死）。宿主 DefaultActivationHandler 对任何激活都导航起始页——用户看到跳转"游戏"页 ≠ 插件收到了激活
+- **激活参数的 COM 代理在激活回调结束后立即失效**（2026-09 远程诊断实证：轮询读 Kind 即抛 0x800706BA 类错误；GetActivatedEventArgs 确实反映热激活，但对象已死）→ **热激活必须订阅 AppInstance.Activated** 并在回调里同步取出 URI 值（只带托管值出来，绝不存 args 引用）；冷启动不触发该事件，由轮询 GetActivatedEventArgs 兜底（初始参数长期有效；同一引用只读一次，失效属预期静默跳过）。宿主 DefaultActivationHandler 对任何激活都导航起始页——用户看到跳转 ≠ 插件收到激活
+- **静态事件订阅的安全做法**（旧规则"绝不订阅"源于未做清理时的 DLL 锁定 UnauthorizedAccessException）：StopAsync 必须 退订 + GC.Collect×2/WaitForPendingFinalizers 释放 WinRT CCW + await 后台 Task 停止 + 清空事件委托；验证方式：插件热更新/卸载一次看是否再报文件占用
 - **宿主 InfoService.Log 的 Informational/Success 级别和 DeveloperEvent 都会被 DevelopmentMode 开关过滤**：给普通用户排查必须用 Warning/Error 级别（始终落 Logs\log.txt）+ DevReportInfo 远程上报（PushService.ReportThrottled 限流）
 - 公共 base64 echo 端点只有 `httpbingo.org/base64/{base64url}` 字节级可靠（2026-09 实测 sha256 完全一致）；httpbin.org 的 /base64 对含 `+`/`/` 的标准 base64 一律 404（百分号编码也不行）——构造测试下载地址别用 httpbin
 - **插件 UI 禁用 XAML，一律纯 C#**：插件 XAML 依赖宿主 v1.10.1+ 的 PluginXamlHost（注册插件 IXamlMetadataProvider + ms-appx 绝对路径 LoadComponent），旧宿主 CreateSettingUi 直接 XamlParseException（2026-09 用户实测崩溃）；不要调用 ResourceLoader.Initialize/加载 Styles 字典；C# 取主题资源用 PluginTheme（ResourceDictionary.TryGetValue 不进 ThemeDictionaries，需递归且必须带回退值）
