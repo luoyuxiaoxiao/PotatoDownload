@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Concurrent;
+using System.Runtime.InteropServices;
 using System.Threading;
 using System.Threading.Tasks;
 using GalgameManager.WinApp.Base.Contracts;
@@ -11,12 +12,16 @@ namespace PotatoVN.App.PluginBase.Services;
 
 /// <summary>
 /// 接收 Shionlib 推送（potato-vn://install 深链）的核心服务。
-/// 双通道轮询捕获协议激活：
-/// 1) <see cref="AppInstance.GetActivatedEventArgs"/> —— 冷启动激活可靠（每次轮询取新对象，避免缓存旧COM对象）；
-/// 2) <see cref="IPotatoVnApi.ActivationArgs"/> —— 宿主在激活回调里同步更新该属性，覆盖应用运行中的
-///    协议重定向激活（此时 GetActivatedEventArgs 可能仍返回最初的 Launch 参数）。
-/// 注意：不能订阅宿主进程静态事件（如 AppInstance.Activated），否则事件委托会锁定插件程序集，
-/// 导致插件更新/卸载时 DLL 无法删除。
+///
+/// 激活捕获策略（2026-09 实测定稿）：
+/// - 热激活（应用运行/托盘时点深链）：订阅 <see cref="AppInstance.Activated"/>。
+///   激活参数的 COM 代理在激活回调结束后立即失效（读取成员即抛 0x800706BA 一类错误），
+///   轮询永远来不及读——必须在事件回调里同步把 URI 值取出来，绝不把 args 存到字段。
+/// - 冷启动激活：首次激活不会触发 Activated 事件（WinAppSDK 语义，事件只覆盖重定向激活），
+///   由后台轮询 <see cref="AppInstance.GetActivatedEventArgs"/> 兜底（初始激活参数长期有效）。
+///
+/// 程序集卸载安全：静态事件订阅会强引用插件委托，因此 <see cref="StopAsync"/> 必须
+/// 退订并强制 GC 释放 WinRT CCW，否则插件更新/卸载时 DLL 删除失败。
 /// </summary>
 public class PushService
 {
@@ -30,7 +35,8 @@ public class PushService
     private readonly ConcurrentDictionary<string, byte> _seenKeys = new();
     private CancellationTokenSource? _cts;
     private Task? _pollTask;
-    private object? _lastHostArgs;
+    private bool _eventSubscribed;
+    private object? _lastPollArgs; // 上次轮询见到的激活参数，引用去重避免对失效对象反复读取
     private int _reportBudget = 30; // 单次插件会话的远程上报配额，避免异常循环刷屏
     private DateTime _lastReportTime = DateTime.MinValue;
 
@@ -43,21 +49,29 @@ public class PushService
         _reportError = reportError;
     }
 
-    /// <summary>
-    /// 启动轮询循环，捕获应用运行中的协议激活。
-    /// 必须在插件 InitializeAsync 中调用。
-    /// </summary>
+    /// <summary>启动激活捕获（事件订阅 + 冷启动轮询兜底）。必须在插件 InitializeAsync 中调用。</summary>
     public void Start()
     {
         if (_cts is not null) return;
         _cts = new CancellationTokenSource();
+        try
+        {
+            AppInstance.GetCurrent().Activated += OnAppInstanceActivated;
+            _eventSubscribed = true;
+        }
+        catch (Exception e)
+        {
+            _hostApi.Log(InfoBarSeverity.Warning,
+                $"PotatoDownload: subscribe AppInstance.Activated failed: {e.Message}");
+            ReportThrottled(e, "PotatoDownload: subscribe AppInstance.Activated failed");
+        }
         _pollTask = Task.Run(() => PollLoopAsync(_cts.Token));
         _hostApi.Log(InfoBarSeverity.Informational, "PotatoDownload: PushService started");
     }
 
     /// <summary>
-    /// 停止轮询并等待后台任务完全结束。
-    /// 必须等待任务完成，否则后台 Task 的委托仍持有插件程序集，插件更新/卸载时 DLL 无法删除。
+    /// 停止捕获并等待后台任务完全结束，退订静态事件并强制 GC 释放 WinRT 引用。
+    /// 不做这些会导致插件程序集被锁定，更新/卸载时 DLL 删除失败。
     /// </summary>
     public async Task StopAsync()
     {
@@ -75,44 +89,66 @@ public class PushService
         _cts = null;
         _pollTask = null;
         RequestReceived = null; // 清空事件委托，确保不残留对插件方法的引用
+
+        if (_eventSubscribed)
+        {
+            _eventSubscribed = false;
+            try
+            {
+                AppInstance.GetCurrent().Activated -= OnAppInstanceActivated;
+            }
+            catch
+            {
+                // ignore
+            }
+            // WinRT 事件退订后，本机侧可能仍缓存着委托的 CCW，强制 GC 将其释放
+            GC.Collect(2, GCCollectionMode.Forced, true);
+            GC.WaitForPendingFinalizers();
+            GC.Collect(2, GCCollectionMode.Forced, true);
+        }
         _hostApi.Log(InfoBarSeverity.Informational, "PotatoDownload: PushService stopped");
     }
 
+    /// <summary>
+    /// 热激活事件回调：回调期间激活参数有效，必须同步把 URI 值取出。
+    /// 只允许把 Uri（托管不可变值）带出去，绝不保留 args 或其成员对象。
+    /// </summary>
+    private void OnAppInstanceActivated(object? sender, AppActivationArguments args)
+    {
+        try
+        {
+            var uri = ExtractUri(args);
+            if (uri is null) return;
+            _hostApi.Log(InfoBarSeverity.Warning,
+                $"PotatoDownload: activation event captured: {uri}");
+            HandleUri(uri, "event");
+        }
+        catch (Exception e)
+        {
+            _hostApi.Log(InfoBarSeverity.Warning,
+                $"PotatoDownload: activation event failed: {e.GetType().Name} 0x{e.HResult:X8} {e.Message}");
+            ReportThrottled(e, "PotatoDownload: activation event failed");
+        }
+    }
+
+    /// <summary>冷启动兜底轮询：初始激活参数长期有效；同一对象只尝试读取一次。</summary>
     private async Task PollLoopAsync(CancellationToken ct)
     {
         while (!ct.IsCancellationRequested)
         {
             try
             {
-                // 通道1：每次轮询获取当前有效的激活参数（缓存旧引用访问会抛 COMException）
                 var args = AppInstance.GetCurrent().GetActivatedEventArgs();
-                if (args is not null)
-                    HandleActivation(args, "sdk");
-            }
-            catch (Exception e)
-            {
-                _hostApi.Log(InfoBarSeverity.Warning,
-                    $"PotatoDownload: poll GetActivatedEventArgs failed: {e.GetType().Name} 0x{e.HResult:X8} {e.Message}");
-                ReportThrottled(e, "PotatoDownload: poll GetActivatedEventArgs failed");
-            }
-            try
-            {
-                // 通道2：宿主记录的最近激活参数。宿主在激活回调里同步替换该属性；
-                // 运行中的协议重定向激活可能只能从这条通道观察到。
-                // 注意：该对象可能在激活回调结束后失效（COM 代理），必须检测到变化后立即读取。
-                var hostArgs = _hostApi.ActivationArgs;
-                if (hostArgs is not null && !ReferenceEquals(hostArgs, _lastHostArgs))
+                if (args is not null && !ReferenceEquals(args, _lastPollArgs))
                 {
-                    _lastHostArgs = hostArgs;
-                    if (hostArgs is AppActivationArguments appArgs)
-                        HandleActivation(appArgs, "host");
+                    _lastPollArgs = args;
+                    HandleActivation(args, "sdk");
                 }
             }
             catch (Exception e)
             {
-                _hostApi.Log(InfoBarSeverity.Warning,
-                    $"PotatoDownload: read host ActivationArgs failed: {e.GetType().Name} 0x{e.HResult:X8} {e.Message}");
-                ReportThrottled(e, "PotatoDownload: read host ActivationArgs failed");
+                _hostApi.Log(InfoBarSeverity.Informational,
+                    $"PotatoDownload: poll GetActivatedEventArgs failed: {e.GetType().Name} 0x{e.HResult:X8}");
             }
             try
             {
@@ -125,54 +161,70 @@ public class PushService
         }
     }
 
-    /// <summary>限流远程上报：同一插件会话内最多上报若干条，且受冷却时间约束。</summary>
-    private void ReportThrottled(Exception? e, string msg)
+    /// <summary>轮询通道的激活处理：失效 COM 代理是预期现象（热激活由事件通道负责）。</summary>
+    private void HandleActivation(AppActivationArguments args, string source)
     {
-        if (_reportError is null) return;
-        if (Interlocked.Decrement(ref _reportBudget) < 0) return;
-        var now = DateTime.UtcNow;
-        if (now - _lastReportTime < ReportCooldown) return;
-        _lastReportTime = now;
-        _ = Task.Run(() => _reportError(e, msg));
+        Uri? uri;
+        try
+        {
+            uri = ExtractUri(args);
+        }
+        catch (COMException e)
+        {
+            // 热激活过后 GetActivatedEventArgs 返回的对象已失效，读取成员必抛——
+            // 该次激活已由事件通道处理，此处静默跳过即可。
+            _hostApi.Log(InfoBarSeverity.Informational,
+                $"PotatoDownload: stale activation args via {source} (0x{e.HResult:X8}), expected for warm activations");
+            return;
+        }
+        catch (Exception e)
+        {
+            _hostApi.Log(InfoBarSeverity.Warning,
+                $"PotatoDownload: read activation via {source} failed: {e.GetType().Name} 0x{e.HResult:X8} {e.Message}");
+            ReportThrottled(e, $"PotatoDownload: read activation via {source} failed");
+            return;
+        }
+        if (uri is null)
+        {
+            _hostApi.Log(InfoBarSeverity.Informational,
+                $"PotatoDownload: activation has no potato-vn URI (via {source})");
+            return;
+        }
+        HandleUri(uri, source);
     }
 
-    private void HandleActivation(AppActivationArguments args, string source)
+    /// <summary>从激活参数中提取 URI（Protocol 直接取；Launch 解析 MSI/侧载的 /p 命令行参数）。</summary>
+    private static Uri? ExtractUri(AppActivationArguments args)
+    {
+        switch (args.Kind)
+        {
+            case ExtendedActivationKind.Protocol:
+                if (args.Data is Windows.ApplicationModel.Activation.ProtocolActivatedEventArgs protocolArgs)
+                    return protocolArgs.Uri;
+                return null;
+            case ExtendedActivationKind.Launch:
+                if (args.Data is Windows.ApplicationModel.Activation.ILaunchActivatedEventArgs launchArgs)
+                    return ExtractUriFromLaunchArguments(launchArgs.Arguments);
+                return null;
+            default:
+                return null;
+        }
+    }
+
+    /// <summary>URI 统一处理：scheme 过滤 → 去重 → 解析校验 → 触发 <see cref="RequestReceived"/>。</summary>
+    private void HandleUri(Uri uri, string source)
     {
         try
         {
-            // 注意：Log 的 Informational 级别会被宿主的开发者模式开关过滤；
-            // 与 potato-vn 推送直接相关的观测一律用 Warning（始终写入 log.txt）。
-            _hostApi.Log(InfoBarSeverity.Informational,
-                $"PotatoDownload: activation kind={args.Kind} via {source}");
-
-            Uri? uri = null;
-
-            switch (args.Kind)
-            {
-                case ExtendedActivationKind.Protocol:
-                    if (args.Data is Windows.ApplicationModel.Activation.ProtocolActivatedEventArgs protocolArgs)
-                        uri = protocolArgs.Uri;
-                    break;
-                case ExtendedActivationKind.Launch:
-                    // MSI/侧载版通过命令行参数传递协议 URL（manifest: Parameters="/p &quot;%1&quot;"）
-                    if (args.Data is Windows.ApplicationModel.Activation.ILaunchActivatedEventArgs launchArgs)
-                        uri = ExtractUriFromLaunchArguments(launchArgs.Arguments);
-                    break;
-            }
-
-            if (uri is null)
-            {
-                _hostApi.Log(InfoBarSeverity.Informational,
-                    $"PotatoDownload: activation has no potato-vn URI (via {source})");
-                return;
-            }
             if (!string.Equals(uri.Scheme, InstallRequest.Scheme, StringComparison.OrdinalIgnoreCase))
             {
                 _hostApi.Log(InfoBarSeverity.Informational,
-                    $"PotatoDownload: activation scheme={uri.Scheme} (not potato-vn)");
+                    $"PotatoDownload: activation scheme={uri.Scheme} (not potato-vn, via {source})");
                 return;
             }
 
+            // 注意：Log 的 Informational 级别会被宿主的开发者模式开关过滤；
+            // 与 potato-vn 推送直接相关的观测一律用 Warning（始终写入 log.txt）。
             _hostApi.Log(InfoBarSeverity.Warning,
                 $"PotatoDownload: potato-vn activation via {source}: {uri}");
 
@@ -210,10 +262,21 @@ public class PushService
         catch (Exception e)
         {
             _hostApi.Log(InfoBarSeverity.Warning,
-                $"PotatoDownload: failed to handle activation: {e.GetType().Name} 0x{e.HResult:X8} {e.Message}");
-            _hostApi.DeveloperEvent(e: e, msg: "PotatoDownload: failed to handle activation");
-            ReportThrottled(e, "PotatoDownload: failed to handle activation");
+                $"PotatoDownload: failed to handle push: {e.GetType().Name} 0x{e.HResult:X8} {e.Message}");
+            _hostApi.DeveloperEvent(e: e, msg: "PotatoDownload: failed to handle push");
+            ReportThrottled(e, "PotatoDownload: failed to handle push");
         }
+    }
+
+    /// <summary>限流远程上报：同一插件会话内最多上报若干条，且受冷却时间约束。</summary>
+    private void ReportThrottled(Exception? e, string msg)
+    {
+        if (_reportError is null) return;
+        if (Interlocked.Decrement(ref _reportBudget) < 0) return;
+        var now = DateTime.UtcNow;
+        if (now - _lastReportTime < ReportCooldown) return;
+        _lastReportTime = now;
+        _ = Task.Run(() => _reportError(e, msg));
     }
 
     /// <summary>从启动命令行参数中提取协议 URL（形如 /p "potato-vn://install?..."）。</summary>
