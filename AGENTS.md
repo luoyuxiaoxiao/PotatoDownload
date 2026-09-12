@@ -59,6 +59,7 @@
 - PotatoVN 已注册 `potato-vn://` scheme（manifest）；插件通过订阅 `AppInstance.GetCurrent().Activated` 捕获协议激活（事件订阅安全做法见 Feedback 区）；`IPotatoVnApi.ActivationArgs` 虽随激活更新，但激活参数 COM 代理在回调结束后立即失效，插件轮询读不到
 - 插件不能调用主程序 `UnpackGameTask`（在主程序程序集）；解压需插件自引 SharpCompress/SevenZip
 - **插件只能调用宿主稳定版（v1.10.2）已有的插件 API**（2026-09 用户实测 MissingMethodException）：dev 版新增的 GetGameByUid/GetGameById/AddVirtualGameAsync(Galgame)/AddSourceAsync/AddGameToSource/SaveGameAsync/InvokeOnMainThreadAsync 一律不能用；精确刮削流程：GetAllGames 按 Ids 手动查重 → AddVirtualGame(name) 建占位后补设 `game.Ids[(int)RssType.*]`（宿主同对象引用，立即生效）→ AddGameInstallation(path)；模型/枚举（Galgame.Ids、RssType 含 Hikarinagi、NameOnlyGameMatchException、GalgameUid）两版一致可用；Plugin.ReportHostApiSurface 启动时上报宿主 API 面（发布前随 DevReportInfo 一并移除）
+- **宿主 AddVirtualGame(name) 会按名字联网刮削，查无此游戏直接抛 PvnException**（requireConfirm:false 也一样）→ EnsurePlaceholderAsync 必须容错返回 null 继续主流程；E2E 测试 title 必须是真实可刮游戏（用 CLANNAD=bgm 13），bgm 237 是动漫《攻壳机动队》不是游戏；api.bgm.tv 在本机构建环境被墙，bgm.tv 网页版可达
 - 参考实现：ReinaManager `src-tauri/src/install/`（protocol/download/workflow），Shionlib `apps/frontend/components/game/download/helpers/reina.ts`
 - 下载架构：DownloadService 多线程分块（4 连接 × 4MB 块，Range 探测失败退化为单连接续传），.part + .part.watermark 断点续传；DownloadManager 串行队列 + ObservableCollection<DownloadTask> 供 UI 绑定
 - UI：侧边栏按钮"下载"→ ContentDialog 弹窗（DownloadProgressDialog，纯C#），无独立页面；设置页 UserControl1（纯C#，下载目录 + 自动下载开关）；主题资源查找走 Helper/PluginTheme
