@@ -63,6 +63,7 @@
 - 下载架构：DownloadService 多线程分块（4 连接 × 4MB 块，Range 探测失败退化为单连接续传），.part + .part.watermark 断点续传；DownloadManager 串行队列 + ObservableCollection<DownloadTask> 供 UI 绑定
 - UI：侧边栏按钮"下载"→ ContentDialog 弹窗（DownloadProgressDialog，纯C#），无独立页面；设置页 UserControl1（纯C#，下载目录 + 自动下载开关）；主题资源查找走 Helper/PluginTheme
 - DevReportInfo 已在 Plugin.cs 实现（上传到应用市场/正式版前必须改为空实现）
+- 测验平台：repo/TestPlatform/index.html（file:// 直开；E2E/过期/坏校验/SSRF/缺参/仅提示预设 + 自定义构造器 + 发送历史）；载荷 payload/test_game.zip（331B，改内容后跑 make-payload.ps1 并更新页面 PAYLOAD 常量）；宿主侧安装入口：插件页"从本地压缩包安装"（AddPluginFromLocalZip），可直接选 artifacts/plugin.pvnplugin.zip
 
 ### Feedback / Lessons
 <!-- 用户纠正过的做法 + 原因。例：- 不要 mock 数据库测试，原因：上次 mock 通过但生产迁移失败 -->
@@ -74,6 +75,7 @@
 - **插件绝不能订阅宿主进程静态事件**（AppInstance.Activated 等）：事件委托锁定插件程序集 → 更新/卸载时 DLL 删除失败（UnauthorizedAccessException）。改用轮询 IPotatoVnApi.ActivationArgs（宿主每次激活更新该属性）；后台 Task 停止时必须 await 完成并清空事件委托
 - **热激活（应用在运行/托盘时点深链）单靠轮询 GetActivatedEventArgs 捕获不到**（2026-09 用户实测：只见初始 Launch 参数或 COM 失效 0x800706BA）→ PushService 双通道轮询：sdk GetActivatedEventArgs + host ActivationArgs（宿主在激活回调里同步替换该属性，检测到引用变化必须立即读取，COM 代理可能已死）。宿主 DefaultActivationHandler 对任何激活都导航起始页——用户看到跳转"游戏"页 ≠ 插件收到了激活
 - **宿主 InfoService.Log 的 Informational/Success 级别和 DeveloperEvent 都会被 DevelopmentMode 开关过滤**：给普通用户排查必须用 Warning/Error 级别（始终落 Logs\log.txt）+ DevReportInfo 远程上报（PushService.ReportThrottled 限流）
+- 公共 base64 echo 端点只有 `httpbingo.org/base64/{base64url}` 字节级可靠（2026-09 实测 sha256 完全一致）；httpbin.org 的 /base64 对含 `+`/`/` 的标准 base64 一律 404（百分号编码也不行）——构造测试下载地址别用 httpbin
 - **插件 UI 禁用 XAML，一律纯 C#**：插件 XAML 依赖宿主 v1.10.1+ 的 PluginXamlHost（注册插件 IXamlMetadataProvider + ms-appx 绝对路径 LoadComponent），旧宿主 CreateSettingUi 直接 XamlParseException（2026-09 用户实测崩溃）；不要调用 ResourceLoader.Initialize/加载 Styles 字典；C# 取主题资源用 PluginTheme（ResourceDictionary.TryGetValue 不进 ThemeDictionaries，需递归且必须带回退值）
 
 ### References

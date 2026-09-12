@@ -1,0 +1,463 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>PotatoDownload 推送测验平台</title>
+<style>
+  :root {
+    --accent: #4f7cff;
+    --ok: #178a50;
+    --warn: #b26a00;
+    --bad: #c42b1c;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #1b1b1f; --card: #26262c; --border: #3a3a42;
+      --text: #e8e8ec; --muted: #a0a0aa; --code-bg: #141417;
+    }
+  }
+  @media (prefers-color-scheme: light) {
+    :root {
+      --bg: #f5f5f7; --card: #ffffff; --border: #dcdce2;
+      --text: #1d1d22; --muted: #66666e; --code-bg: #eeeef2;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; padding: 24px 16px 64px;
+    font-family: "Segoe UI", "Microsoft YaHei", sans-serif;
+    background: var(--bg); color: var(--text);
+    display: flex; justify-content: center;
+  }
+  main { width: 100%; max-width: 920px; }
+  h1 { font-size: 22px; margin: 0 0 4px; }
+  h2 { font-size: 17px; margin: 28px 0 12px; border-left: 4px solid var(--accent); padding-left: 10px; }
+  .sub { color: var(--muted); font-size: 13px; margin-bottom: 8px; }
+  .card {
+    background: var(--card); border: 1px solid var(--border);
+    border-radius: 8px; padding: 14px 16px; margin-bottom: 12px;
+  }
+  .card h3 { margin: 0 0 6px; font-size: 15px; }
+  .card p { margin: 4px 0; font-size: 13px; line-height: 1.6; }
+  .expect { color: var(--muted); }
+  .expect b { color: var(--text); font-weight: 600; }
+  .tag { display: inline-block; font-size: 11px; padding: 1px 8px; border-radius: 10px; margin-right: 6px; vertical-align: 1px; }
+  .tag-ok { background: color-mix(in srgb, var(--ok) 18%, transparent); color: var(--ok); }
+  .tag-warn { background: color-mix(in srgb, var(--warn) 18%, transparent); color: var(--warn); }
+  .tag-bad { background: color-mix(in srgb, var(--bad) 18%, transparent); color: var(--bad); }
+  button {
+    font: inherit; font-size: 13px; cursor: pointer;
+    border: 1px solid var(--border); border-radius: 6px;
+    background: var(--accent); color: #fff; padding: 6px 14px; margin-top: 8px;
+  }
+  button.secondary { background: transparent; color: var(--text); }
+  button:hover { filter: brightness(1.1); }
+  input, select, textarea {
+    font: inherit; font-size: 13px; width: 100%;
+    background: var(--code-bg); color: var(--text);
+    border: 1px solid var(--border); border-radius: 6px; padding: 6px 8px;
+  }
+  textarea { resize: vertical; word-break: break-all; }
+  label { display: block; font-size: 12px; color: var(--muted); margin: 10px 0 3px; }
+  .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 0 16px; }
+  .grid-3 { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 0 16px; }
+  .row { display: flex; gap: 8px; align-items: center; }
+  .hint { font-size: 12px; color: var(--muted); }
+  .err { font-size: 12px; color: var(--bad); min-height: 16px; margin-top: 6px; }
+  code, .mono { font-family: Consolas, "Cascadia Mono", monospace; font-size: 12px; }
+  .urlbox {
+    background: var(--code-bg); border: 1px solid var(--border); border-radius: 6px;
+    padding: 8px; margin-top: 10px; max-height: 110px; overflow: auto;
+    word-break: break-all; font-family: Consolas, monospace; font-size: 11.5px; line-height: 1.5;
+  }
+  table { border-collapse: collapse; width: 100%; font-size: 12.5px; }
+  th, td { border: 1px solid var(--border); padding: 6px 8px; text-align: left; vertical-align: top; }
+  th { background: var(--code-bg); }
+  #historyList { font-size: 12px; }
+  #historyList li { margin: 6px 0; word-break: break-all; }
+  .pill { font-size: 11px; color: var(--muted); }
+  ol.prereq { font-size: 13px; line-height: 1.9; margin: 8px 0; padding-left: 20px; }
+</style>
+</head>
+<body>
+<main>
+  <h1>PotatoDownload 推送测验平台</h1>
+  <div class="sub">一键构造并发送 <code>potato-vn://install</code> 深链推送，验证插件的下载 → 校验 → 解压 → 入库全链路。直接用浏览器打开本文件即可（无需联网加载页面资源）。</div>
+
+  <h2>前置条件</h2>
+  <div class="card">
+    <ol class="prereq">
+      <li>PotatoVN 处于运行状态（窗口或系统托盘均可）。</li>
+      <li>PotatoDownload 插件已安装并启用。安装方式：PotatoVN → 插件页 → 顶部「从本地压缩包安装」，选择 <code>PotatoVN.App.PluginBase\artifacts\plugin.pvnplugin.zip</code>。</li>
+      <li>除「仅提示」用例外，请确认插件设置中的「自动下载」为开启状态。</li>
+      <li>测试载荷托管于公共 echo 服务（默认 httpbingo.org），需要能访问公网。</li>
+    </ol>
+  </div>
+
+  <h2>预设测试用例</h2>
+  <div id="presets"></div>
+
+  <h2>自定义推送构造器</h2>
+  <div class="card">
+    <div class="grid">
+      <div>
+        <label>下载地址（url）*</label>
+        <input id="f_url" spellcheck="false">
+        <div class="hint">默认指向内置测试载荷（test_game.zip，331 字节）。也可以自己托管 <code>payload\test_game.zip</code> 后把直链填进来——size 与校验和会自动按内置载荷重新计算。</div>
+      </div>
+      <div>
+        <label>title（标题）*</label>
+        <input id="f_title" value="PotatoDownload 测试游戏">
+        <label>bgm_id *</label>
+        <input id="f_bgm" value="237">
+        <div class="hint">入库后会按该 Bangumi subject id 刮削元数据。</div>
+      </div>
+    </div>
+    <div class="grid-3">
+      <div>
+        <label>provider *</label>
+        <input id="f_provider" value="test">
+      </div>
+      <div>
+        <label>resource_id *</label>
+        <input id="f_resid" value="test-e2e-001">
+        <div class="hint"><label style="display:inline;margin:0"><input type="checkbox" id="f_unique" checked style="width:auto;vertical-align:-1px"> 发送时自动附加时间戳后缀，避免被插件永久去重</label></div>
+      </div>
+      <div>
+        <label>file_name *</label>
+        <input id="f_fname" value="test_game.zip">
+      </div>
+    </div>
+    <div class="grid-3">
+      <div>
+        <label>archive_format *</label>
+        <select id="f_format">
+          <option selected>zip</option><option>7z</option><option>rar</option><option>tar</option>
+          <option>tar.gz</option><option>tar.bz2</option><option>tar.xz</option><option>tar.zst</option>
+        </select>
+      </div>
+      <div>
+        <label>size（字节）*</label>
+        <input id="f_size" type="number">
+      </div>
+      <div>
+        <label>expires_at（Unix 秒）*</label>
+        <input id="f_expires" type="number" value="2000000000">
+        <div class="hint" id="expiresHint"></div>
+      </div>
+    </div>
+    <div class="grid-3">
+      <div>
+        <label>checksum_algo</label>
+        <select id="f_algo">
+          <option value="sha256" selected>sha256</option>
+          <option value="">（不校验）</option>
+        </select>
+      </div>
+      <div>
+        <label>checksum（64 位小写 hex）</label>
+        <input id="f_checksum" spellcheck="false">
+      </div>
+      <div>
+        <label>archive_password（可选）</label>
+        <input id="f_password">
+      </div>
+    </div>
+    <div class="err" id="formErr"></div>
+    <div class="urlbox mono" id="urlPreview"></div>
+    <div class="row">
+      <button id="btnSendCustom">发送推送</button>
+      <button class="secondary" id="btnCopy">复制链接</button>
+    </div>
+  </div>
+
+  <h2>发送历史</h2>
+  <div class="card">
+    <p class="hint">插件对 30 秒内完全相同的链接只处理一次；同一 provider + resource_id + checksum + url 的推送永久去重。预设用例和勾选「附加时间戳后缀」的自定义推送每次都会生成新 resource_id，因此总能被处理。</p>
+    <ul id="historyList"></ul>
+    <button class="secondary" id="btnClearHistory">清空历史</button>
+  </div>
+
+  <h2>在哪里观测结果</h2>
+  <div class="card">
+    <p>① 屏幕右上角弹条 / 通知铃铛：「开始下载」「完成」以及各类错误提示。</p>
+    <p>② PotatoVN 侧边栏「下载」按钮 → 弹窗内实时任务列表与进度条。</p>
+    <p>③ 游戏库：成功用例会新增一个游戏条目（按 bgm_id 刮削）。</p>
+    <p>④ 日志文件：PotatoVN 数据目录下 <code>Logs\log.txt</code>，含 <code>PotatoDownload:</code> 前缀的诊断记录（Warning 级别始终写入）。</p>
+    <p>⑤ 清理测试残留：删除游戏库中的测试条目；下载目录（默认为插件目录下 <code>downloads\test_game\</code>）可手动删除。</p>
+  </div>
+
+  <h2>协议参数速查（v1）</h2>
+  <div class="card">
+    <table>
+      <tr><th>参数</th><th>必填</th><th>说明</th></tr>
+      <tr><td><code>v</code></td><td>是</td><td>协议版本，固定 1</td></tr>
+      <tr><td><code>provider</code></td><td>是</td><td><code>^[a-z0-9._-]{1,64}$</code></td></tr>
+      <tr><td><code>resource_id</code></td><td>是</td><td>资源唯一标识，≤256 字符</td></tr>
+      <tr><td><code>url</code></td><td>是</td><td>http/https 直链，禁止本机/内网地址</td></tr>
+      <tr><td><code>file_name</code></td><td>是</td><td>安全的单个文件名（不能含路径分隔符）</td></tr>
+      <tr><td><code>archive_format</code></td><td>是</td><td>7z / zip / rar / tar / tar.gz / tar.bz2 / tar.xz / tar.zst</td></tr>
+      <tr><td><code>size</code></td><td>是</td><td>文件字节数，&gt;0</td></tr>
+      <tr><td><code>checksum_algo</code> + <code>checksum</code></td><td>成对</td><td>sha256 或 blake3；64 位小写 hex</td></tr>
+      <tr><td><code>expires_at</code></td><td>是</td><td>Unix 秒；过期后下载阶段报错</td></tr>
+      <tr><td><code>bgm_id</code></td><td>是</td><td>Bangumi subject id，用于精确刮削</td></tr>
+      <tr><td><code>title</code></td><td>是</td><td>游戏标题</td></tr>
+      <tr><td><code>vndb_id</code> / <code>hikarinagi_id</code> / <code>archive_password</code></td><td>否</td><td>补充 ID 与压缩包密码</td></tr>
+    </table>
+  </div>
+</main>
+
+<script>
+"use strict";
+
+// ===== 内置测试载荷（由 make-payload.ps1 生成，payload\test_game.zip）=====
+const PAYLOAD = {
+  base64url: "UEsDBBQAAAAIAAAAIVz11Vl9OAAAADYAAAAIAAAAZ2FtZS5leGULyC9JLMl3yS_Py8lPTFFwNXJVKEktLlFIrUhNLi1JTMpJ1VPwyy9RSFQoSk3MUUhPzE3V4-UCAFBLAwQUAAAACAAAACFcV3-pi0EAAABEAAAACgAAAHJlYWRtZS50eHQLyC9JLMl3yS_Py8lPTFFIzUvRLcnXBVIKJanFJQoFiZUgcR2F9NS81KLEktQUhaRKhRCgVEBOYklaflGuHi8XAFBLAQIUABQAAAAIAAAAIVz11Vl9OAAAADYAAAAIAAAAAAAAAAAAAAAAAAAAAABnYW1lLmV4ZVBLAQIUABQAAAAIAAAAIVxXf6mLQQAAAEQAAAAKAAAAAAAAAAAAAAAAAF4AAAByZWFkbWUudHh0UEsFBgAAAAACAAIAbgAAAMcAAAAAAA",
+  size: 331,
+  // 静态回退值；页面加载后会用 WebCrypto 重新计算校验
+  sha256: "bd3be3d638a19c8bd6302bbac0eec7b832834df88c2b715fdf7a2b1ce71cd780",
+};
+
+const ENDPOINT = "https://httpbingo.org/base64/";
+const EXPIRES_FAR = 2000000000; // 2033-05-18
+
+function payloadBytes() {
+  const b64 = PAYLOAD.base64url.replace(/-/g, "+").replace(/_/g, "/");
+  const bin = atob(b64);
+  const bytes = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+  return bytes;
+}
+
+async function upgradeSha256() {
+  try {
+    if (!crypto.subtle) return;
+    const digest = await crypto.subtle.digest("SHA-256", payloadBytes());
+    const hex = [...new Uint8Array(digest)].map(b => b.toString(16).padStart(2, "0")).join("");
+    if (hex !== PAYLOAD.sha256) {
+      console.warn("payload sha256 mismatch, using computed value", hex);
+      PAYLOAD.sha256 = hex;
+    }
+    refreshForm();
+  } catch { /* 保持静态值 */ }
+}
+
+function defaultDownloadUrl() { return ENDPOINT + PAYLOAD.base64url; }
+
+function buildInstallUrl(p) {
+  const pairs = [
+    ["v", "1"], ["provider", p.provider], ["resource_id", p.resourceId],
+    ["url", p.url], ["file_name", p.fileName], ["archive_format", p.archiveFormat],
+    ["size", String(p.size)],
+  ];
+  if (p.checksumAlgo) pairs.push(["checksum_algo", p.checksumAlgo], ["checksum", p.checksum]);
+  pairs.push(["expires_at", String(p.expiresAt)], ["bgm_id", p.bgmId], ["title", p.title]);
+  if (p.archivePassword) pairs.push(["archive_password", p.archivePassword]);
+  if (p.omit) for (const k of p.omit) {
+    const i = pairs.findIndex(x => x[0] === k);
+    if (i >= 0) pairs.splice(i, 1);
+  }
+  return "potato-vn://install?" + pairs.map(([k, v]) => k + "=" + encodeURIComponent(v)).join("&");
+}
+
+function validPresetParams(overrides = {}) {
+  return Object.assign({
+    provider: "test", resourceId: "test-e2e-001",
+    url: defaultDownloadUrl(), fileName: "test_game.zip", archiveFormat: "zip",
+    size: PAYLOAD.size, checksumAlgo: "sha256", checksum: PAYLOAD.sha256,
+    expiresAt: EXPIRES_FAR, bgmId: "237", title: "PotatoDownload 测试游戏",
+  }, overrides);
+}
+
+const PRESETS = [
+  {
+    cls: "ok", name: "完整流程（E2E）",
+    desc: "参数全部合法的推送。验证 下载 → sha256 校验 → 解压 → 入库 → 刮削 全链路。",
+    expect: "弹条提示「开始下载」→ 侧边栏「下载」弹窗可见任务推进 → 提示「完成」→ 游戏库新增条目（按 bgm_id 刮削）。",
+    params: () => validPresetParams(),
+  },
+  {
+    cls: "warn", name: "已过期链接",
+    desc: "expires_at 设为 2001 年。推送会被接受并入队，但下载阶段判定链接过期。",
+    expect: "任务出现后失败；弹条/事件提示链接已过期。",
+    params: () => validPresetParams({ resourceId: "test-expired-001", expiresAt: 1000000000, title: "PotatoDownload 过期链接测试" }),
+  },
+  {
+    cls: "warn", name: "校验和错误",
+    desc: "checksum 故意填成全 0。文件能下载完，但 sha256 校验必然失败。",
+    expect: "任务在「校验」阶段失败并提示校验不匹配。",
+    params: () => validPresetParams({ resourceId: "test-badsum-001", checksum: "0".repeat(64), title: "PotatoDownload 校验失败测试" }),
+  },
+  {
+    cls: "bad", name: "内网地址（SSRF 防护）",
+    desc: "url 指向 192.168 内网地址。插件应在解析阶段直接拒绝，不产生任何任务。",
+    expect: "弹错误「无效的推送请求: 下载 URL 不允许指向本机或内网地址」；下载弹窗中无新任务。",
+    params: () => validPresetParams({ resourceId: "test-ssrf-001", url: "http://192.168.1.100/test_game.zip", title: "PotatoDownload SSRF 测试" }),
+  },
+  {
+    cls: "bad", name: "缺少必填参数",
+    desc: "故意去掉 size 参数。插件应在解析阶段拒绝并指出缺哪个参数。",
+    expect: "弹错误「无效的推送请求: 缺少或无效参数: size」。",
+    params: () => validPresetParams({ resourceId: "test-missing-001", title: "PotatoDownload 缺参测试", omit: ["size"] }),
+  },
+  {
+    cls: "ok", name: "仅提示（自动下载关闭时）",
+    desc: "先在插件设置里把「自动下载」关掉，再发送本用例（参数与 E2E 相同）。",
+    expect: "只弹「收到推送（自动下载已关闭）」，不进入下载。",
+    params: () => validPresetParams({ resourceId: "test-notify-001", title: "PotatoDownload 仅提示测试" }),
+  },
+];
+
+function send(label, url) {
+  const history = JSON.parse(localStorage.getItem("pvnPushHistory") || "[]");
+  history.unshift({ time: new Date().toLocaleString(), label, url });
+  localStorage.setItem("pvnPushHistory", JSON.stringify(history.slice(0, 20)));
+  renderHistory();
+  window.location.href = url;
+}
+
+function renderPresets() {
+  const box = document.getElementById("presets");
+  box.innerHTML = "";
+  for (const p of PRESETS) {
+    const div = document.createElement("div");
+    div.className = "card";
+    div.innerHTML =
+      `<h3><span class="tag tag-${p.cls}">${p.cls === "ok" ? "正例" : p.cls === "warn" ? "边界" : "反例"}</span>${p.name}</h3>` +
+      `<p>${p.desc}</p><p class="expect"><b>预期：</b>${p.expect}</p>`;
+    const btn = document.createElement("button");
+    btn.textContent = "发送此推送";
+    btn.onclick = () => {
+      // 每次点击附加唯一后缀，避免被插件的永久去重（provider+resource_id+checksum+url）拦下
+      const params = p.params();
+      params.resourceId += "-" + Date.now().toString(36);
+      send(p.name, buildInstallUrl(params));
+    };
+    div.appendChild(btn);
+    box.appendChild(div);
+  }
+}
+
+function renderHistory() {
+  const history = JSON.parse(localStorage.getItem("pvnPushHistory") || "[]");
+  const ul = document.getElementById("historyList");
+  ul.innerHTML = history.length
+    ? history.map(h => `<li><span class="pill">${h.time}</span> <b>${h.label}</b><br><code>${h.url.slice(0, 160)}${h.url.length > 160 ? "…" : ""}</code></li>`).join("")
+    : "<li class='hint'>暂无记录</li>";
+}
+
+// ===== 自定义构造器 =====
+const F = id => document.getElementById(id);
+
+function readForm() {
+  return {
+    url: F("f_url").value.trim(),
+    provider: F("f_provider").value.trim(),
+    resourceId: F("f_resid").value.trim(),
+    fileName: F("f_fname").value.trim(),
+    archiveFormat: F("f_format").value,
+    size: F("f_size").value.trim(),
+    expiresAt: F("f_expires").value.trim(),
+    checksumAlgo: F("f_algo").value,
+    checksum: F("f_checksum").value.trim().toLowerCase(),
+    archivePassword: F("f_password").value,
+    bgmId: F("f_bgm").value.trim(),
+    title: F("f_title").value.trim(),
+  };
+}
+
+// 与插件 InstallRequest.Validate 对齐的前端校验
+function validate(p) {
+  if (!/^[a-z0-9._-]{1,64}$/.test(p.provider)) return "provider 格式无效（^[a-z0-9._-]{1,64}$）";
+  if (!p.resourceId || p.resourceId.length > 256) return "resource_id 为空或过长";
+  let u;
+  try { u = new URL(p.url); } catch { return "下载 URL 无效"; }
+  if (u.protocol !== "http:" && u.protocol !== "https:") return "下载 URL 必须是 http/https";
+  const host = u.hostname.toLowerCase().replace(/\.$/, "");
+  if (host === "localhost" || host === "0.0.0.0" || host === "::1" ||
+      /\.(local|internal|lan|home)$/.test(host) ||
+      /^10\./.test(host) || /^172\.(1[6-9]|2\d|3[01])\./.test(host) ||
+      /^192\.168\./.test(host) || /^169\.254\./.test(host) || host === "127.0.0.1")
+    return "下载 URL 不允许指向本机或内网地址";
+  if (!p.fileName || p.fileName === "." || p.fileName === ".." || /[/\\:]/.test(p.fileName)) return "file_name 必须是安全的单个文件名";
+  if (!/^\d+$/.test(p.size) || BigInt(p.size) <= 0n) return "size 必须为正整数";
+  if (p.checksumAlgo && !/^[0-9a-f]{64}$/.test(p.checksum)) return "checksum 必须是 64 位小写 hex";
+  if (!p.checksumAlgo && p.checksum) return "选择「不校验」时 checksum 必须留空";
+  if (!/^\d+$/.test(p.expiresAt) || BigInt(p.expiresAt) <= 0n) return "expires_at 必须为正整数（Unix 秒）";
+  if (!p.bgmId) return "bgm_id 不能为空";
+  if (!p.title) return "title 不能为空";
+  if (p.archivePassword && /[\r\n\0]/.test(p.archivePassword)) return "archive_password 包含非法字符";
+  return null;
+}
+
+function refreshForm() {
+  const p = readForm();
+  const err = validate(p);
+  F("formErr").textContent = err || "";
+  const preview = err ? "（修正上方问题后生成链接）"
+    : buildInstallUrl({
+        provider: p.provider, resourceId: p.resourceId, url: p.url,
+        fileName: p.fileName, archiveFormat: p.archiveFormat, size: p.size,
+        checksumAlgo: p.checksumAlgo || null, checksum: p.checksum,
+        expiresAt: p.expiresAt, bgmId: p.bgmId, title: p.title,
+        archivePassword: p.archivePassword || null,
+      });
+  F("urlPreview").textContent = preview;
+  return err ? null : preview;
+}
+
+function fillDefaults() {
+  F("f_url").value = defaultDownloadUrl();
+  F("f_size").value = PAYLOAD.size;
+  F("f_checksum").value = PAYLOAD.sha256;
+}
+
+function init() {
+  renderPresets();
+  renderHistory();
+  fillDefaults();
+  const exp = F("f_expires");
+  const updateExpHint = () => {
+    const v = Number(exp.value);
+    F("expiresHint").textContent = v > 0 ? "≈ " + new Date(v * 1000).toLocaleString() : "";
+  };
+  exp.addEventListener("input", () => { updateExpHint(); refreshForm(); });
+  updateExpHint();
+  document.querySelectorAll("input, select, textarea").forEach(el =>
+    el.addEventListener("input", refreshForm));
+  F("btnSendCustom").onclick = () => {
+    const p = readForm();
+    const err = validate(p);
+    F("formErr").textContent = err || "";
+    if (err) return;
+    if (F("f_unique").checked) p.resourceId += "-" + Date.now().toString(36);
+    const url = buildInstallUrl({
+      provider: p.provider, resourceId: p.resourceId, url: p.url,
+      fileName: p.fileName, archiveFormat: p.archiveFormat, size: p.size,
+      checksumAlgo: p.checksumAlgo || null, checksum: p.checksum,
+      expiresAt: p.expiresAt, bgmId: p.bgmId, title: p.title,
+      archivePassword: p.archivePassword || null,
+    });
+    F("urlPreview").textContent = url;
+    send("自定义推送", url);
+  };
+  F("btnCopy").onclick = async () => {
+    const url = refreshForm();
+    if (!url) return;
+    try { await navigator.clipboard.writeText(url); F("btnCopy").textContent = "已复制"; }
+    catch { F("btnCopy").textContent = "复制失败，请手动复制"; }
+    setTimeout(() => F("btnCopy").textContent = "复制链接", 1500);
+  };
+  F("btnClearHistory").onclick = () => {
+    localStorage.removeItem("pvnPushHistory");
+    renderHistory();
+  };
+  refreshForm();
+  upgradeSha256();
+}
+
+init();
+</script>
+</body>
+</html>
