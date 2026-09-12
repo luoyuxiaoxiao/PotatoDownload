@@ -126,7 +126,7 @@ StampedFiles = stampedFiles.ToArray();
   </Target>
 
   <ItemGroup>
-    <None Remove="Controls\ExamplePage.xaml" />
+    <None Remove="Controls\DownloadProgressDialog.xaml" />
   </ItemGroup>
   <ItemGroup>
     <PackageReference Include="Microsoft.Windows.SDK.BuildTools" Version="10.0.26100.4948">
@@ -147,7 +147,7 @@ StampedFiles = stampedFiles.ToArray();
     <Resource Remove="artifacts\plugin.pvnplugin\PotatoVN.App.PluginBase\Controls\UserControl1.xaml" />
   </ItemGroup>
   <ItemGroup>
-    <Page Update="Controls\ExamplePage.xaml">
+    <Page Update="Controls\DownloadProgressDialog.xaml">
       <Generator>MSBuild:Compile</Generator>
     </Page>
     <None Update="Strings\en-US.json">

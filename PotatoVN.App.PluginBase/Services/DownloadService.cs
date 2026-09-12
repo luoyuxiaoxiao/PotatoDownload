@@ -1,6 +1,8 @@
 using System;
+using System.Collections.Concurrent;
 using System.IO;
 using System.Net.Http;
+using System.Net.Http.Headers;
 using System.Security.Cryptography;
 using System.Threading;
 using System.Threading.Tasks;
@@ -10,10 +12,17 @@ using PotatoVN.App.PluginBase.Models;
 namespace PotatoVN.App.PluginBase.Services;
 
 /// <summary>
-/// 下载服务：从签名直链下载压缩包，校验文件大小与 SHA-256/BLAKE3 哈希。
+/// 下载服务：多线程分块下载 + 断点续传。
+/// 支持 Range 请求的服务器会分块并行下载；不支持时自动退化为单连接顺序下载。
+/// 断点续传通过 .part 文件 + 水位记录实现，中断后再次下载会从已提交字节继续。
 /// </summary>
 public class DownloadService
 {
+    private const int ChunkSize = 4 * 1024 * 1024; // 每块 4MB
+    private const int MaxConnections = 4;          // 最大并行连接数
+    private const int MaxRetries = 3;              // 单块失败重试次数
+    private const int BufferSize = 81920;
+
     private readonly HttpClient _httpClient;
 
     public DownloadService()
@@ -26,11 +35,11 @@ public class DownloadService
     }
 
     /// <summary>
-    /// 下载文件到目标路径。
+    /// 下载文件到目标路径（支持断点续传与多线程分块）。
     /// </summary>
     /// <param name="request">推送请求（含 URL、期望大小、校验值）</param>
-    /// <param name="targetPath">下载文件保存路径</param>
-    /// <param name="onProgress">进度回调 (已下载字节, 总字节)</param>
+    /// <param name="targetPath">下载文件保存路径（最终产物）</param>
+    /// <param name="onProgress">进度回调 (已提交字节, 总字节)</param>
     /// <param name="ct">取消令牌</param>
     public async Task DownloadAsync(InstallRequest request, string targetPath,
         Action<long, long>? onProgress = null, CancellationToken ct = default)
@@ -38,27 +47,192 @@ public class DownloadService
         if (request.IsExpired(DateTimeOffset.Now))
             throw new DownloadException("下载直链已过期，请重新从资源提供方推送任务");
 
-        using var response = await _httpClient.GetAsync(request.Url,
+        var partPath = targetPath + ".part";
+        var watermarkPath = targetPath + ".part.watermark";
+
+        // 探测服务器是否支持 Range
+        var rangeSupported = await ProbeRangeAsync(request.Url, ct);
+
+        if (rangeSupported)
+        {
+            await DownloadChunkedAsync(request, partPath, watermarkPath, onProgress, ct);
+        }
+        else
+        {
+            await DownloadSequentialAsync(request, partPath, watermarkPath, onProgress, ct);
+        }
+
+        // 校验并落盘为最终文件
+        await VerifyChecksumAsync(request, partPath, ct);
+        if (File.Exists(targetPath)) File.Delete(targetPath);
+        File.Move(partPath, targetPath);
+        TryDelete(watermarkPath);
+    }
+
+    /// <summary>探测服务器是否支持 HTTP Range（发一个小 Range 请求，206 即支持）。</summary>
+    private async Task<bool> ProbeRangeAsync(string url, CancellationToken ct)
+    {
+        try
+        {
+            using var request = new HttpRequestMessage(HttpMethod.Get, url);
+            request.Headers.Range = new RangeHeaderValue(0, 0);
+            using var response = await _httpClient.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, ct);
+            return response.StatusCode == System.Net.HttpStatusCode.PartialContent;
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    /// <summary>多线程分块下载：每块独立连接，Range 请求，写入文件对应偏移。</summary>
+    private async Task DownloadChunkedAsync(InstallRequest request, string partPath,
+        string watermarkPath, Action<long, long>? onProgress, CancellationToken ct)
+    {
+        var totalBytes = (long)request.Size;
+        var committed = ReadWatermark(watermarkPath, totalBytes);
+        var chunkCount = (int)((totalBytes + ChunkSize - 1) / ChunkSize);
+
+        // 已提交水位之前的块视为已完成
+        var completedChunks = new bool[chunkCount];
+        for (var i = 0; i < chunkCount; i++)
+        {
+            var chunkStart = (long)i * ChunkSize;
+            if (chunkStart < committed) completedChunks[i] = true;
+        }
+
+        // 打开文件句柄（共享写，各块线程可并发写不同偏移）
+        await using var fileStream = new FileStream(partPath, FileMode.OpenOrCreate, FileAccess.Write,
+            FileShare.ReadWrite, BufferSize, true);
+        fileStream.SetLength(totalBytes);
+
+        var pending = new ConcurrentQueue<int>();
+        for (var i = 0; i < chunkCount; i++)
+            if (!completedChunks[i]) pending.Enqueue(i);
+
+        var workers = new Task[MaxConnections];
+        for (var w = 0; w < MaxConnections; w++)
+            workers[w] = Task.Run(async () =>
+            {
+                while (pending.TryDequeue(out var chunkIndex))
+                {
+                    ct.ThrowIfCancellationRequested();
+                    var start = (long)chunkIndex * ChunkSize;
+                    var end = Math.Min(start + ChunkSize, totalBytes) - 1;
+                    await DownloadChunkWithRetryAsync(request.Url, fileStream, start, end, ct);
+                    Interlocked.Add(ref committed, end - start + 1);
+                    onProgress?.Invoke(committed, totalBytes);
+                    SaveWatermark(watermarkPath, committed);
+                }
+            }, ct);
+        await Task.WhenAll(workers);
+    }
+
+    private async Task DownloadChunkWithRetryAsync(string url, FileStream fileStream,
+        long start, long end, CancellationToken ct)
+    {
+        for (var attempt = 0; ; attempt++)
+        {
+            try
+            {
+                using var request = new HttpRequestMessage(HttpMethod.Get, url);
+                request.Headers.Range = new RangeHeaderValue(start, end);
+                using var response = await _httpClient.SendAsync(request,
+                    HttpCompletionOption.ResponseHeadersRead, ct);
+                response.EnsureSuccessStatusCode();
+                await using var contentStream = await response.Content.ReadAsStreamAsync(ct);
+                var buffer = new byte[BufferSize];
+                var offset = start;
+                int read;
+                while ((read = await contentStream.ReadAsync(buffer.AsMemory(0, buffer.Length), ct)) > 0)
+                {
+                    fileStream.Seek(offset, SeekOrigin.Begin);
+                    await fileStream.WriteAsync(buffer.AsMemory(0, read), ct);
+                    offset += read;
+                }
+                return;
+            }
+            catch (OperationCanceledException) when (ct.IsCancellationRequested)
+            {
+                throw;
+            }
+            catch (Exception) when (attempt < MaxRetries - 1)
+            {
+                await Task.Delay(500 * (attempt + 1), ct);
+            }
+        }
+    }
+
+    /// <summary>单连接顺序下载（服务器不支持 Range 时的回退方案）。</summary>
+    private async Task DownloadSequentialAsync(InstallRequest request, string partPath,
+        string watermarkPath, Action<long, long>? onProgress, CancellationToken ct)
+    {
+        var totalBytes = (long)request.Size;
+        var committed = ReadWatermark(watermarkPath, totalBytes);
+
+        using var httpRequest = new HttpRequestMessage(HttpMethod.Get, request.Url);
+        if (committed > 0)
+            httpRequest.Headers.Range = new RangeHeaderValue(committed, null);
+        using var response = await _httpClient.SendAsync(httpRequest,
             HttpCompletionOption.ResponseHeadersRead, ct);
         response.EnsureSuccessStatusCode();
 
-        var totalBytes = (long)request.Size;
         await using var contentStream = await response.Content.ReadAsStreamAsync(ct);
-        await using var fileStream = new FileStream(targetPath, FileMode.Create, FileAccess.Write,
-            FileShare.None, 81920, true);
+        await using var fileStream = new FileStream(partPath, FileMode.OpenOrCreate, FileAccess.Write,
+            FileShare.None, BufferSize, true);
+        fileStream.Seek(committed, SeekOrigin.Begin);
 
-        var buffer = new byte[81920];
-        long totalRead = 0;
+        var buffer = new byte[BufferSize];
         int read;
         while ((read = await contentStream.ReadAsync(buffer.AsMemory(0, buffer.Length), ct)) > 0)
         {
             await fileStream.WriteAsync(buffer.AsMemory(0, read), ct);
-            totalRead += read;
-            onProgress?.Invoke(totalRead, totalBytes);
+            committed += read;
+            onProgress?.Invoke(committed, totalBytes);
+            SaveWatermark(watermarkPath, committed);
         }
 
-        if (totalRead != totalBytes)
-            throw new DownloadException($"文件大小校验失败：期望 {totalBytes}，实际 {totalRead}");
+        if (committed != totalBytes)
+            throw new DownloadException($"文件大小校验失败：期望 {totalBytes}，实际 {committed}");
+    }
+
+    private static long ReadWatermark(string watermarkPath, long totalBytes)
+    {
+        try
+        {
+            if (File.Exists(watermarkPath) &&
+                long.TryParse(File.ReadAllText(watermarkPath), out var value))
+                return Math.Clamp(value, 0, totalBytes);
+        }
+        catch
+        {
+            // ignore
+        }
+        return 0;
+    }
+
+    private static void SaveWatermark(string watermarkPath, long committed)
+    {
+        try
+        {
+            File.WriteAllText(watermarkPath, committed.ToString());
+        }
+        catch
+        {
+            // 水位写入失败不阻塞下载
+        }
+    }
+
+    private static void TryDelete(string path)
+    {
+        try
+        {
+            if (File.Exists(path)) File.Delete(path);
+        }
+        catch
+        {
+            // ignore
+        }
     }
 
     /// <summary>

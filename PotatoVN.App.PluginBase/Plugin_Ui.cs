@@ -18,15 +18,34 @@ public partial class Plugin : IGalgamePageLeftPanel, IGalgamePageRightPanel
         _hostApi.RegisterSidebarButton(new SidebarButtonInfo
         {
            Id = "potato-download",
-           Text = "PotatoDownload",
+           Text = "下载",
            Placement = SidebarButtonPlacement.Menu, 
            FluentGlyph = "&#xE896;",
         }, () =>
         {
-            _hostApi.NavigateTo(typeof(ExamplePage), "PotatoDownload");
+            ShowDownloadDialog();
             return Task.CompletedTask;
         });
         _uiInit = true;
+    }
+
+    /// <summary>弹出下载进度弹窗（模态）。</summary>
+    private void ShowDownloadDialog()
+    {
+        _hostApi.InvokeOnMainThread(() =>
+        {
+            var window = _hostApi.GetMainWindow();
+            if (window is null) return;
+            var dialog = new ContentDialog
+            {
+                XamlRoot = window.Content.XamlRoot,
+                Title = "PotatoDownload",
+                Content = new DownloadProgressDialog(),
+                CloseButtonText = "关闭",
+                DefaultButton = ContentDialogButton.Close,
+            };
+            _ = dialog.ShowAsync();
+        });
     }
 
     public FrameworkElement CreateSettingUi() => new UserControl1(_data);
