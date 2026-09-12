@@ -23,6 +23,7 @@ public class PushService
     private readonly IPotatoVnApi _hostApi;
     private readonly ConcurrentDictionary<string, byte> _seenKeys = new();
     private CancellationTokenSource? _cts;
+    private Task? _pollTask;
     private string? _lastProcessedUri;
 
     /// <summary>收到新推送请求时触发（已通过校验与去重）。</summary>
@@ -41,14 +42,29 @@ public class PushService
     {
         if (_cts is not null) return;
         _cts = new CancellationTokenSource();
-        _ = Task.Run(() => PollLoopAsync(_cts.Token));
+        _pollTask = Task.Run(() => PollLoopAsync(_cts.Token));
     }
 
-    public void Stop()
+    /// <summary>
+    /// 停止轮询并等待后台任务完全结束。
+    /// 必须等待任务完成，否则后台 Task 的委托仍持有插件程序集，插件更新/卸载时 DLL 无法删除。
+    /// </summary>
+    public async Task StopAsync()
     {
-        _cts?.Cancel();
-        _cts?.Dispose();
+        if (_cts is null) return;
+        _cts.Cancel();
+        try
+        {
+            if (_pollTask is not null) await _pollTask;
+        }
+        catch
+        {
+            // ignore
+        }
+        _cts.Dispose();
         _cts = null;
+        _pollTask = null;
+        RequestReceived = null; // 清空事件委托，确保不残留对插件方法的引用
     }
 
     private async Task PollLoopAsync(CancellationToken ct)

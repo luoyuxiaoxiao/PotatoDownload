@@ -59,12 +59,11 @@ namespace PotatoVN.App.PluginBase
             _pushService.Start();
         }
         
-        public Task OnUninstallAsync(bool deleteData, Action<TimeSpan> extendWaitHandler, CancellationToken cts)
+        public async Task OnUninstallAsync(bool deleteData, Action<TimeSpan> extendWaitHandler, CancellationToken cts)
         {
-            if (cts.IsCancellationRequested) return Task.FromCanceled(cts);
-            _pushService?.Stop();
+            if (cts.IsCancellationRequested) return;
+            if (_pushService is not null) await _pushService.StopAsync();
             ResourceLoader.Unload(); // 卸载XAML资源字典
-            return Task.CompletedTask;
         }
         
         private void SaveData()
