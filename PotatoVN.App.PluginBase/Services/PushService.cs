@@ -11,8 +11,10 @@ namespace PotatoVN.App.PluginBase.Services;
 
 /// <summary>
 /// 接收 Shionlib 推送（potato-vn://install 深链）的核心服务。
-/// 通过轮询 <see cref="AppInstance.GetActivatedEventArgs"/> 捕获协议激活（AppLifecycle 标准用法，
-/// 每次调用返回当前有效的激活参数，不会因宿主替换引用而失效）。
+/// 双通道轮询捕获协议激活：
+/// 1) <see cref="AppInstance.GetActivatedEventArgs"/> —— 冷启动激活可靠（每次轮询取新对象，避免缓存旧COM对象）；
+/// 2) <see cref="IPotatoVnApi.ActivationArgs"/> —— 宿主在激活回调里同步更新该属性，覆盖应用运行中的
+///    协议重定向激活（此时 GetActivatedEventArgs 可能仍返回最初的 Launch 参数）。
 /// 注意：不能订阅宿主进程静态事件（如 AppInstance.Activated），否则事件委托会锁定插件程序集，
 /// 导致插件更新/卸载时 DLL 无法删除。
 /// </summary>
@@ -20,19 +22,25 @@ public class PushService
 {
     private static readonly TimeSpan PollInterval = TimeSpan.FromSeconds(2);
     private static readonly TimeSpan DedupeWindow = TimeSpan.FromSeconds(30);
+    private static readonly TimeSpan ReportCooldown = TimeSpan.FromSeconds(30);
 
     private readonly IPotatoVnApi _hostApi;
+    private readonly Func<Exception?, string?, Task>? _reportError;
     private readonly ConcurrentDictionary<string, DateTime> _seenUris = new();
     private readonly ConcurrentDictionary<string, byte> _seenKeys = new();
     private CancellationTokenSource? _cts;
     private Task? _pollTask;
+    private object? _lastHostArgs;
+    private int _reportBudget = 30; // 单次插件会话的远程上报配额，避免异常循环刷屏
+    private DateTime _lastReportTime = DateTime.MinValue;
 
     /// <summary>收到新推送请求时触发（已通过校验与去重）。</summary>
     public event Func<InstallRequest, Task>? RequestReceived;
 
-    public PushService(IPotatoVnApi hostApi)
+    public PushService(IPotatoVnApi hostApi, Func<Exception?, string?, Task>? reportError = null)
     {
         _hostApi = hostApi;
+        _reportError = reportError;
     }
 
     /// <summary>
@@ -76,14 +84,35 @@ public class PushService
         {
             try
             {
-                // 每次轮询获取当前有效的激活参数（宿主替换旧引用后，旧对象访问会抛 COMException）
+                // 通道1：每次轮询获取当前有效的激活参数（缓存旧引用访问会抛 COMException）
                 var args = AppInstance.GetCurrent().GetActivatedEventArgs();
                 if (args is not null)
-                    HandleActivation(args);
+                    HandleActivation(args, "sdk");
             }
             catch (Exception e)
             {
-                _hostApi.DeveloperEvent(e: e, msg: "PotatoDownload: poll activation failed");
+                _hostApi.Log(InfoBarSeverity.Warning,
+                    $"PotatoDownload: poll GetActivatedEventArgs failed: {e.GetType().Name} 0x{e.HResult:X8} {e.Message}");
+                ReportThrottled(e, "PotatoDownload: poll GetActivatedEventArgs failed");
+            }
+            try
+            {
+                // 通道2：宿主记录的最近激活参数。宿主在激活回调里同步替换该属性；
+                // 运行中的协议重定向激活可能只能从这条通道观察到。
+                // 注意：该对象可能在激活回调结束后失效（COM 代理），必须检测到变化后立即读取。
+                var hostArgs = _hostApi.ActivationArgs;
+                if (hostArgs is not null && !ReferenceEquals(hostArgs, _lastHostArgs))
+                {
+                    _lastHostArgs = hostArgs;
+                    if (hostArgs is AppActivationArguments appArgs)
+                        HandleActivation(appArgs, "host");
+                }
+            }
+            catch (Exception e)
+            {
+                _hostApi.Log(InfoBarSeverity.Warning,
+                    $"PotatoDownload: read host ActivationArgs failed: {e.GetType().Name} 0x{e.HResult:X8} {e.Message}");
+                ReportThrottled(e, "PotatoDownload: read host ActivationArgs failed");
             }
             try
             {
@@ -96,12 +125,25 @@ public class PushService
         }
     }
 
-    private void HandleActivation(AppActivationArguments args)
+    /// <summary>限流远程上报：同一插件会话内最多上报若干条，且受冷却时间约束。</summary>
+    private void ReportThrottled(Exception? e, string msg)
+    {
+        if (_reportError is null) return;
+        if (Interlocked.Decrement(ref _reportBudget) < 0) return;
+        var now = DateTime.UtcNow;
+        if (now - _lastReportTime < ReportCooldown) return;
+        _lastReportTime = now;
+        _ = Task.Run(() => _reportError(e, msg));
+    }
+
+    private void HandleActivation(AppActivationArguments args, string source)
     {
         try
         {
+            // 注意：Log 的 Informational 级别会被宿主的开发者模式开关过滤；
+            // 与 potato-vn 推送直接相关的观测一律用 Warning（始终写入 log.txt）。
             _hostApi.Log(InfoBarSeverity.Informational,
-                $"PotatoDownload: activation kind={args.Kind}");
+                $"PotatoDownload: activation kind={args.Kind} via {source}");
 
             Uri? uri = null;
 
@@ -121,7 +163,7 @@ public class PushService
             if (uri is null)
             {
                 _hostApi.Log(InfoBarSeverity.Informational,
-                    "PotatoDownload: activation has no potato-vn URI");
+                    $"PotatoDownload: activation has no potato-vn URI (via {source})");
                 return;
             }
             if (!string.Equals(uri.Scheme, InstallRequest.Scheme, StringComparison.OrdinalIgnoreCase))
@@ -130,6 +172,9 @@ public class PushService
                     $"PotatoDownload: activation scheme={uri.Scheme} (not potato-vn)");
                 return;
             }
+
+            _hostApi.Log(InfoBarSeverity.Warning,
+                $"PotatoDownload: potato-vn activation via {source}: {uri}");
 
             var uriString = uri.ToString();
             var now = DateTime.UtcNow;
@@ -150,7 +195,7 @@ public class PushService
                     $"PotatoDownload: duplicate push ignored ({request.Title})");
                 return;
             }
-            _hostApi.Log(InfoBarSeverity.Informational,
+            _hostApi.Log(InfoBarSeverity.Warning,
                 $"PotatoDownload: push received ({request.Title})");
             _ = Task.Run(() => RequestReceived?.Invoke(request));
         }
@@ -158,10 +203,16 @@ public class PushService
         {
             _hostApi.Event(InfoBarSeverity.Error, "PotatoDownload",
                 msg: $"无效的推送请求: {e.Message}");
+            _hostApi.Log(InfoBarSeverity.Warning,
+                $"PotatoDownload: invalid push rejected: {e.Message}");
+            ReportThrottled(e, "PotatoDownload: invalid push rejected");
         }
         catch (Exception e)
         {
+            _hostApi.Log(InfoBarSeverity.Warning,
+                $"PotatoDownload: failed to handle activation: {e.GetType().Name} 0x{e.HResult:X8} {e.Message}");
             _hostApi.DeveloperEvent(e: e, msg: "PotatoDownload: failed to handle activation");
+            ReportThrottled(e, "PotatoDownload: failed to handle activation");
         }
     }
 

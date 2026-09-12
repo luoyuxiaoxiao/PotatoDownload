@@ -59,7 +59,7 @@ namespace PotatoVN.App.PluginBase
             InitUi();
 
             DownloadManager = new DownloadManager(_hostApi);
-            _pushService = new PushService(_hostApi);
+            _pushService = new PushService(_hostApi, DevReportInfo);
             _pushService.RequestReceived += OnPushRequestReceived;
             _pushService.Start();
         }
@@ -107,6 +107,8 @@ namespace PotatoVN.App.PluginBase
                     "PotatoDownload", $"收到推送（自动下载已关闭）: {request.Title}");
                 return Task.CompletedTask;
             }
+            _hostApi.Info(Microsoft.UI.Xaml.Controls.InfoBarSeverity.Informational,
+                "PotatoDownload", $"开始下载: {request.Title}");
             _ = DownloadManager.EnqueueAsync(request);
             return Task.CompletedTask;
         }
