@@ -60,6 +60,8 @@
 - 插件不能调用主程序 `UnpackGameTask`（在主程序程序集）；解压需插件自引 SharpCompress/SevenZip
 - 精确刮削：构造 Galgame 设 `Ids[(int)RssType.Bangumi/Vndb/Hikarinagi]` → `AddVirtualGameAsync` 建占位 → `AddGameInstallation(path)` 关联路径（UID 精确命中）
 - 参考实现：ReinaManager `src-tauri/src/install/`（protocol/download/workflow），Shionlib `apps/frontend/components/game/download/helpers/reina.ts`
+- 下载架构：DownloadService 多线程分块（4 连接 × 4MB 块，Range 探测失败退化为单连接续传），.part + .part.watermark 断点续传；DownloadManager 串行队列 + ObservableCollection<DownloadTask> 供 UI 绑定
+- UI：侧边栏按钮"下载"→ ContentDialog 弹窗（DownloadProgressDialog.xaml，任务列表 + ProgressBar），无独立页面；设置页 UserControl1（下载目录 + 自动下载开关）
 
 ### Feedback / Lessons
 <!-- 用户纠正过的做法 + 原因。例：- 不要 mock 数据库测试，原因：上次 mock 通过但生产迁移失败 -->
