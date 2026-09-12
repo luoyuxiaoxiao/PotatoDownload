@@ -1,6 +1,7 @@
 using System;
 using System.IO;
 using System.Linq;
+using System.Net;
 using System.Text.RegularExpressions;
 
 namespace PotatoVN.App.PluginBase.Models;
@@ -82,6 +83,8 @@ public class InstallRequest
             (downloadUrl.Scheme != Uri.UriSchemeHttp && downloadUrl.Scheme != Uri.UriSchemeHttps) ||
             string.IsNullOrEmpty(downloadUrl.Host))
             throw new InstallRequestException("下载 URL 无效");
+        if (IsPrivateOrLoopbackHost(downloadUrl.Host))
+            throw new InstallRequestException("下载 URL 不允许指向本机或内网地址");
 
         if (!IsSafeFileName(FileName))
             throw new InstallRequestException("file_name 必须是安全的单个文件名");
@@ -125,6 +128,36 @@ public class InstallRequest
         if (value.IndexOfAny(['/', '\\', ':']) >= 0) return false;
         var fileName = Path.GetFileName(value);
         return string.Equals(fileName, value, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// 判断主机是否指向本机/内网（对齐 LunaBox 协议的安全策略，防止 SSRF）。
+    /// 拒绝：localhost、回环、私有网段、链路本地、0.0.0.0、常见内网域名后缀。
+    /// </summary>
+    private static bool IsPrivateOrLoopbackHost(string host)
+    {
+        var normalized = host.Trim().TrimEnd('.').ToLowerInvariant();
+        if (normalized is "localhost" or "0.0.0.0" or "::1") return true;
+        if (normalized.EndsWith(".local", StringComparison.Ordinal) ||
+            normalized.EndsWith(".internal", StringComparison.Ordinal) ||
+            normalized.EndsWith(".lan", StringComparison.Ordinal) ||
+            normalized.EndsWith(".home", StringComparison.Ordinal))
+            return true;
+
+        if (IPAddress.TryParse(normalized, out var ip))
+        {
+            if (IPAddress.IsLoopback(ip)) return true;
+            if (ip.AddressFamily == System.Net.Sockets.AddressFamily.InterNetwork)
+            {
+                var bytes = ip.GetAddressBytes();
+                // 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 169.254.0.0/16
+                if (bytes[0] == 10) return true;
+                if (bytes[0] == 172 && bytes[1] is >= 16 and <= 31) return true;
+                if (bytes[0] == 192 && bytes[1] == 168) return true;
+                if (bytes[0] == 169 && bytes[1] == 254) return true;
+            }
+        }
+        return false;
     }
 
     private static uint ParseUInt(string? value, string name)
