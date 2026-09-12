@@ -64,6 +64,7 @@
 - UI：侧边栏按钮"下载"→ ContentDialog 弹窗（DownloadProgressDialog，纯C#），无独立页面；设置页 UserControl1（纯C#，下载目录 + 自动下载开关）；主题资源查找走 Helper/PluginTheme
 - DevReportInfo 已在 Plugin.cs 实现（上传到应用市场/正式版前必须改为空实现）
 - 测验平台：repo/TestPlatform/index.html（file:// 直开；E2E/过期/坏校验/SSRF/缺参/仅提示预设 + 自定义构造器 + 发送历史）；载荷 payload/test_game.zip（331B，改内容后跑 make-payload.ps1 并更新页面 PAYLOAD 常量）；宿主侧安装入口：插件页"从本地压缩包安装"（AddPluginFromLocalZip），可直接选 artifacts/plugin.pvnplugin.zip
+- **测试功能已内置进插件**：侧边栏"推送测试"按钮 → TestPushDialog（Helper/TestPush.cs 构造 5 种预设深链，ShellExecute 触发，等效浏览器点击）。**发布应用市场前必须移除**（与 DevReportInfo 空实现同级要求）；用户够不到构建机 C 盘，一切交付只能走 upload_test_build 的公网链接
 
 ### Feedback / Lessons
 <!-- 用户纠正过的做法 + 原因。例：- 不要 mock 数据库测试，原因：上次 mock 通过但生产迁移失败 -->
