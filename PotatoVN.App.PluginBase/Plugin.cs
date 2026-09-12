@@ -36,7 +36,8 @@ namespace PotatoVN.App.PluginBase
             HostApi = hostApi;
             XamlResourceLocatorFactory.PackagePath = _hostApi.GetPluginPath();
             PluginLocalization.Initialize(hostApi); //初始化插件多国语言支持，如果你的插件不需要支持多语言，可以不调用这个方法，直接在代码里写死字符串即可。
-            ResourceLoader.Initialize(); //初始化XAML字典加载器，资源用法请参考ResourceLoader类的注释
+            //注意：本插件UI一律使用纯C#构建，不要调用ResourceLoader加载XAML资源字典
+            //（插件XAML依赖宿主v1.10.1+的承载机制，旧宿主上会XamlParseException）。
             var dataJson = await _hostApi.GetDataAsync();
             if (!string.IsNullOrWhiteSpace(dataJson))
             {
@@ -67,13 +68,35 @@ namespace PotatoVN.App.PluginBase
         {
             if (cts.IsCancellationRequested) return;
             if (_pushService is not null) await _pushService.StopAsync();
-            ResourceLoader.Unload(); // 卸载XAML资源字典
         }
-        
+
         private void SaveData()
         {
             var dataJson = System.Text.Json.JsonSerializer.Serialize(_data);
             _ = _hostApi.SaveDataAsync(dataJson);
+        }
+
+        /// <summary>开发期错误上报。发布到应用市场前必须改为空实现，避免污染报错库。</summary>
+        public async Task DevReportInfo(Exception? ex, string? msg)
+        {
+            try
+            {
+                var body = new
+                {
+                    message = msg ?? ex?.Message,
+                    stack_trace = ex?.StackTrace,
+                };
+                using var content = new System.Net.Http.StringContent(
+                    System.Text.Json.JsonSerializer.Serialize(body),
+                    System.Text.Encoding.UTF8,
+                    "application/json");
+                await new System.Net.Http.HttpClient().PostAsync(
+                    $"https://plugin.potatovn.net/api/vibe/plugins/{Id}/runtime-errors", content);
+            }
+            catch
+            {
+                //上报失败不应影响插件本体
+            }
         }
 
         private Task OnPushRequestReceived(InstallRequest request)

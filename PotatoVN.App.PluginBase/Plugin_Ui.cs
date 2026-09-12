@@ -34,20 +34,38 @@ public partial class Plugin : IGalgamePageLeftPanel, IGalgamePageRightPanel
     {
         _hostApi.InvokeOnMainThread(() =>
         {
-            var window = _hostApi.GetMainWindow();
-            if (window is null) return;
-            var dialog = new ContentDialog
+            try
             {
-                XamlRoot = window.Content.XamlRoot,
-                Content = new DownloadProgressDialog(),
-                CloseButtonText = "关闭",
-                DefaultButton = ContentDialogButton.Close,
-            };
-            _ = dialog.ShowAsync();
+                var window = _hostApi.GetMainWindow();
+                if (window is null) return;
+                var dialog = new ContentDialog
+                {
+                    XamlRoot = window.Content.XamlRoot,
+                    Content = new DownloadProgressDialog(),
+                    CloseButtonText = "关闭",
+                    DefaultButton = ContentDialogButton.Close,
+                };
+                _ = dialog.ShowAsync();
+            }
+            catch (System.Exception e)
+            {
+                _ = DevReportInfo(e, "ShowDownloadDialog failed");
+            }
         });
     }
 
-    public FrameworkElement CreateSettingUi() => new UserControl1(_data);
+    public FrameworkElement CreateSettingUi()
+    {
+        try
+        {
+            return new UserControl1(_data);
+        }
+        catch (System.Exception e)
+        {
+            _ = DevReportInfo(e, "CreateSettingUi failed");
+            return new TextBlock { Text = $"PotatoDownload 设置界面加载失败: {e.Message}" };
+        }
+    }
     
     public async Task<FrameworkElement> CreateLeftPanelUiAsync(Galgame game)
     {
