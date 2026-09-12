@@ -304,9 +304,9 @@ const PRESETS = [
     params: () => validPresetParams({ resourceId: "test-missing-001", omit: ["size"] }),
   },
   {
-    cls: "ok", name: "仅提示（自动下载关闭时）",
+    cls: "ok", name: "确认下载（自动下载关闭时）",
     desc: "先在插件设置里把「自动下载」关掉，再发送本用例（参数与 E2E 相同）。",
-    expect: "只弹「收到推送（自动下载已关闭）」，不进入下载。",
+    expect: "弹出「确认下载」对话框；点击「下载」后才开始，点「取消」则忽略。",
     params: () => validPresetParams({ resourceId: "test-notify-001" }),
   },
 ];

@@ -15,17 +15,7 @@ public partial class Plugin : IGalgamePageLeftPanel, IGalgamePageRightPanel
     private void InitUi()
     {
         if (_uiInit) return;
-        _hostApi.RegisterSidebarButton(new SidebarButtonInfo
-        {
-           Id = "potato-download",
-           Text = "下载",
-           Placement = SidebarButtonPlacement.Menu,
-           FluentGlyph = "&#xE896;",
-        }, () =>
-        {
-            ShowDownloadDialog();
-            return Task.CompletedTask;
-        });
+        UpdateDownloadSidebarState(0);
         // 开发期测试入口：发布应用市场前必须移除
         _hostApi.RegisterSidebarButton(new SidebarButtonInfo
         {
@@ -39,6 +29,37 @@ public partial class Plugin : IGalgamePageLeftPanel, IGalgamePageRightPanel
             return Task.CompletedTask;
         });
         _uiInit = true;
+    }
+
+    /// <summary>
+    /// 刷新侧边栏「下载」按钮的外观：无活动任务时显示静态下载图标，
+    /// 有活动任务时切换为同步图标并显示任务数（对齐 Chrome 下载按钮的状态变化）。
+    /// 通过 Unregister+Register 替换实现（宿主 API 没有原地更新按钮的接口）。
+    /// </summary>
+    internal void UpdateDownloadSidebarState(int activeCount)
+    {
+        _hostApi.InvokeOnMainThread(() =>
+        {
+            try
+            {
+                _hostApi.UnregisterSidebarButton("potato-download");
+                _hostApi.RegisterSidebarButton(new SidebarButtonInfo
+                {
+                    Id = "potato-download",
+                    Text = activeCount > 0 ? $"下载中 ({activeCount})" : "下载",
+                    Placement = SidebarButtonPlacement.Menu,
+                    FluentGlyph = activeCount > 0 ? "&#xE895;" : "&#xE896;",
+                }, () =>
+                {
+                    ShowDownloadDialog();
+                    return Task.CompletedTask;
+                });
+            }
+            catch (System.Exception e)
+            {
+                _ = DevReportInfo(e, "UpdateDownloadSidebarState failed");
+            }
+        });
     }
 
     /// <summary>弹出推送测试面板（模态）。</summary>
@@ -67,26 +88,33 @@ public partial class Plugin : IGalgamePageLeftPanel, IGalgamePageRightPanel
         });
     }
 
-    /// <summary>弹出下载进度弹窗（模态）。</summary>
+    private bool _downloadDialogOpen;
+
+    /// <summary>弹出下载进度弹窗（模态；已打开时不重复弹出）。</summary>
     private void ShowDownloadDialog()
     {
         _hostApi.InvokeOnMainThread(() =>
         {
             try
             {
+                if (_downloadDialogOpen) return;
                 var window = _hostApi.GetMainWindow();
                 if (window is null) return;
+                _downloadDialogOpen = true;
                 var dialog = new ContentDialog
                 {
                     XamlRoot = window.Content.XamlRoot,
+                    Title = "下载",
                     Content = new DownloadProgressDialog(),
                     CloseButtonText = "关闭",
                     DefaultButton = ContentDialogButton.Close,
                 };
+                dialog.Closed += (_, _) => _downloadDialogOpen = false;
                 _ = dialog.ShowAsync();
             }
             catch (System.Exception e)
             {
+                _downloadDialogOpen = false;
                 _ = DevReportInfo(e, "ShowDownloadDialog failed");
             }
         });

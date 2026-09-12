@@ -3,107 +3,237 @@ using System.ComponentModel;
 using Microsoft.UI.Text;
 using Microsoft.UI.Xaml;
 using Microsoft.UI.Xaml.Controls;
+using Microsoft.UI.Xaml.Media;
 using PotatoVN.App.PluginBase.Helper;
+using PotatoVN.App.PluginBase.Models;
 using PotatoVN.App.PluginBase.Services;
 
 namespace PotatoVN.App.PluginBase.Controls;
 
 /// <summary>
-/// 下载进度弹窗内容：展示任务列表与每个任务的进度条/状态。
-/// 纯C#构建，不使用XAML（插件XAML依赖宿主v1.10.1+的XAML承载机制，旧宿主上直接XamlParseException）。
+/// 下载面板（对齐 Chrome 下载页）：上方「进行中」实时任务（进度条 + 速度 + 完成度），
+/// 下方「历史记录」（持久化的完成/失败记录，含时间与结果）。纯 C# 构建。
 /// </summary>
 public sealed class DownloadProgressDialog : UserControl
 {
-    private readonly StackPanel _listPanel;
-    private readonly ScrollViewer _scrollViewer;
+    private const string GlyphFont = "Segoe MDL2 Assets";
+
+    private readonly StackPanel _activePanel;
+    private readonly StackPanel _historyPanel;
+    private readonly TextBlock _activeHeader;
+    private readonly TextBlock _historyHeader;
     private readonly TextBlock _emptyText;
 
     public DownloadProgressDialog()
     {
-        _listPanel = new StackPanel { Spacing = 12 };
-        _scrollViewer = new ScrollViewer
-        {
-            MaxHeight = 320,
-            Content = _listPanel,
-            Visibility = Visibility.Collapsed,
-            VerticalScrollBarVisibility = ScrollBarVisibility.Auto,
-        };
+        _activeHeader = CreateHeader("进行中");
+        _activePanel = new StackPanel { Spacing = 10 };
+        _historyHeader = CreateHeader("历史记录");
+        _historyPanel = new StackPanel { Spacing = 10 };
         _emptyText = new TextBlock
         {
             Text = "当前没有下载任务",
             HorizontalAlignment = HorizontalAlignment.Center,
             VerticalAlignment = VerticalAlignment.Center,
+            Margin = new Thickness(0, 24, 0, 24),
         };
         if (PluginTheme.GetBrush("TextFillColorSecondaryBrush") is { } secondary)
             _emptyText.Foreground = secondary;
 
-        var root = new StackPanel { Spacing = 12, MinHeight = 120 };
-        root.Children.Add(_scrollViewer);
+        var root = new StackPanel { Spacing = 10 };
+        root.Children.Add(_activeHeader);
+        root.Children.Add(_activePanel);
+        root.Children.Add(_historyHeader);
+        root.Children.Add(_historyPanel);
         root.Children.Add(_emptyText);
-        MinWidth = 420;
-        Content = root;
 
-        Plugin.DownloadManager.Tasks.CollectionChanged += OnTasksChanged;
+        MinWidth = 480;
+        Content = new ScrollViewer
+        {
+            Content = root,
+            MaxHeight = 520,
+            VerticalScrollBarVisibility = ScrollBarVisibility.Auto,
+        };
+
+        Plugin.DownloadManager.Tasks.CollectionChanged += OnCollectionChanged;
+        Plugin.HistoryCollection.CollectionChanged += OnCollectionChanged;
         Unloaded += (_, _) =>
         {
-            Plugin.DownloadManager.Tasks.CollectionChanged -= OnTasksChanged;
-            DetachRows();
+            Plugin.DownloadManager.Tasks.CollectionChanged -= OnCollectionChanged;
+            Plugin.HistoryCollection.CollectionChanged -= OnCollectionChanged;
+            DetachRows(_activePanel);
         };
-        RebuildTaskList();
+        Rebuild();
     }
 
-    private void OnTasksChanged(object? sender, NotifyCollectionChangedEventArgs e) =>
-        Plugin.HostApi.InvokeOnMainThread(RebuildTaskList);
-
-    private void DetachRows()
+    private static TextBlock CreateHeader(string text) => new()
     {
-        foreach (var child in _listPanel.Children)
+        Text = text,
+        FontWeight = FontWeights.SemiBold,
+        FontSize = 13,
+        Margin = new Thickness(0, 4, 0, 0),
+        Opacity = 0.8,
+    };
+
+    private void OnCollectionChanged(object? sender, NotifyCollectionChangedEventArgs e) =>
+        Plugin.HostApi.InvokeOnMainThread(Rebuild);
+
+    private static void DetachRows(Panel panel)
+    {
+        foreach (var child in panel.Children)
             if (child is TaskRow row) row.Detach();
     }
 
-    private void RebuildTaskList()
+    private void Rebuild()
     {
-        DetachRows();
-        _listPanel.Children.Clear();
+        DetachRows(_activePanel);
+        _activePanel.Children.Clear();
+        var activeCount = 0;
         foreach (var task in Plugin.DownloadManager.Tasks)
-            _listPanel.Children.Add(new TaskRow(task));
+        {
+            if (!task.IsActive) continue;
+            _activePanel.Children.Add(new TaskRow(task));
+            activeCount++;
+        }
+        _activeHeader.Visibility = activeCount > 0 ? Visibility.Visible : Visibility.Collapsed;
 
-        var hasTasks = Plugin.DownloadManager.Tasks.Count > 0;
-        _scrollViewer.Visibility = hasTasks ? Visibility.Visible : Visibility.Collapsed;
-        _emptyText.Visibility = hasTasks ? Visibility.Collapsed : Visibility.Visible;
+        _historyPanel.Children.Clear();
+        var historyCount = 0;
+        foreach (var record in Plugin.HistoryCollection)
+        {
+            _historyPanel.Children.Add(CreateHistoryRow(record));
+            historyCount++;
+        }
+        _historyHeader.Visibility = historyCount > 0 ? Visibility.Visible : Visibility.Collapsed;
+
+        _emptyText.Visibility = activeCount + historyCount == 0 ? Visibility.Visible : Visibility.Collapsed;
     }
 
-    /// <summary>单个任务的行：标题 + 状态 + 进度条，跟随任务属性变化实时刷新。</summary>
-    private sealed class TaskRow : StackPanel
+    private static string StageText(DownloadTaskStage stage) => stage switch
+    {
+        DownloadTaskStage.Pending => "等待中",
+        DownloadTaskStage.Downloading => "下载中",
+        DownloadTaskStage.Verifying => "校验中",
+        DownloadTaskStage.Unpacking => "解压中",
+        DownloadTaskStage.Importing => "入库中",
+        DownloadTaskStage.Completed => "已完成",
+        DownloadTaskStage.Failed => "失败",
+        _ => stage.ToString(),
+    };
+
+    private static TextBlock Glyph(string glyph, Brush? brush = null) => new()
+    {
+        Text = glyph,
+        FontFamily = new FontFamily(GlyphFont),
+        FontSize = 16,
+        Foreground = brush,
+        VerticalAlignment = VerticalAlignment.Top,
+        Margin = new Thickness(0, 2, 0, 0),
+    };
+
+    private static Border Card(Grid content)
+    {
+        var border = new Border
+        {
+            CornerRadius = new CornerRadius(5),
+            BorderThickness = new Thickness(1),
+            Padding = new Thickness(12, 8, 12, 8),
+            Child = content,
+        };
+        if (PluginTheme.GetBrush("LayerFillColorDefaultBrush") is { } background)
+            border.Background = background;
+        if (PluginTheme.GetBrush("CardStrokeColorDefaultBrush") is { } stroke)
+            border.BorderBrush = stroke;
+        return border;
+    }
+
+    private static Grid TwoColumnGrid()
+    {
+        var grid = new Grid();
+        grid.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+        grid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+        grid.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+        return grid;
+    }
+
+    private static FrameworkElement CreateHistoryRow(DownloadRecord record)
+    {
+        var ok = record.Outcome == DownloadRecord.OutcomeCompleted;
+        var glyphBrush = PluginTheme.GetBrush(ok ? "SystemFillColorSuccessBrush" : "SystemFillColorCriticalBrush");
+
+        var grid = TwoColumnGrid();
+        grid.Children.Add(Glyph(ok ? "" : "", glyphBrush));
+
+        var textStack = new StackPanel { Spacing = 2, Margin = new Thickness(10, 0, 10, 0) };
+        Grid.SetColumn(textStack, 1);
+        textStack.Children.Add(new TextBlock
+        {
+            Text = record.Title,
+            TextTrimming = TextTrimming.CharacterEllipsis,
+        });
+        textStack.Children.Add(new TextBlock
+        {
+            Text = ok
+                ? $"已完成 · {DownloadManager.FormatBytes(record.Size)}"
+                : $"失败：{record.Message}",
+            FontSize = 12,
+            Opacity = 0.65,
+            TextWrapping = TextWrapping.Wrap,
+        });
+        grid.Children.Add(textStack);
+
+        var timeText = new TextBlock
+        {
+            Text = record.FinishedAt.ToLocalTime().ToString("MM-dd HH:mm"),
+            FontSize = 12,
+            Opacity = 0.55,
+            VerticalAlignment = VerticalAlignment.Top,
+        };
+        Grid.SetColumn(timeText, 2);
+        grid.Children.Add(timeText);
+
+        return Card(grid);
+    }
+
+    /// <summary>活动任务行：图标 + 标题/状态 + 进度条 + 速度/完成度。</summary>
+    private sealed class TaskRow : UserControl
     {
         private readonly DownloadTask _task;
+        private readonly TextBlock _rightText;
         private readonly TextBlock _messageText;
         private readonly ProgressBar _progressBar;
 
         public TaskRow(DownloadTask task)
         {
             _task = task;
-            Spacing = 6;
-            Padding = new Thickness(0, 4, 0, 4);
 
-            var header = new Grid();
-            header.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
-            header.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
-            header.Children.Add(new TextBlock
+            var grid = TwoColumnGrid();
+            grid.Children.Add(Glyph(""));
+
+            var centerStack = new StackPanel { Spacing = 2, Margin = new Thickness(10, 0, 10, 0) };
+            Grid.SetColumn(centerStack, 1);
+            centerStack.Children.Add(new TextBlock
             {
                 Text = task.Title,
                 TextTrimming = TextTrimming.CharacterEllipsis,
                 FontWeight = FontWeights.SemiBold,
             });
-            _messageText = new TextBlock();
-            if (PluginTheme.GetBrush("TextFillColorSecondaryBrush") is { } secondary)
-                _messageText.Foreground = secondary;
-            Grid.SetColumn(_messageText, 1);
-            header.Children.Add(_messageText);
-            Children.Add(header);
+            _messageText = new TextBlock { FontSize = 12, Opacity = 0.65, TextWrapping = TextWrapping.Wrap };
+            centerStack.Children.Add(_messageText);
+            _progressBar = new ProgressBar { Height = 4, Maximum = 100, Margin = new Thickness(0, 4, 0, 0) };
+            centerStack.Children.Add(_progressBar);
+            grid.Children.Add(centerStack);
 
-            _progressBar = new ProgressBar { Height = 4, Maximum = 100 };
-            Children.Add(_progressBar);
+            _rightText = new TextBlock
+            {
+                FontSize = 12,
+                VerticalAlignment = VerticalAlignment.Top,
+                TextAlignment = TextAlignment.Right,
+            };
+            Grid.SetColumn(_rightText, 2);
+            grid.Children.Add(_rightText);
+
+            Content = Card(grid);
 
             Refresh();
             _task.PropertyChanged += OnTaskPropertyChanged;
@@ -118,6 +248,9 @@ public sealed class DownloadProgressDialog : UserControl
         {
             _messageText.Text = _task.Message;
             _progressBar.Value = _task.ProgressPercent;
+            _rightText.Text = _task.Stage == DownloadTaskStage.Downloading && _task.Total > 0
+                ? $"{_task.ProgressPercent:F0}% · {DownloadManager.FormatBytes((long)_task.SpeedBytesPerSec)}/s"
+                : StageText(_task.Stage);
         }
     }
 }

@@ -33,7 +33,7 @@ internal static class TestPush
         new Scenario(
             "完整流程（E2E）",
             "以真实游戏条目 CLANNAD（bgm_id=13）推送：下载 → sha256 校验 → 解压 → 入库 → 刮削。测试后请删除库中 CLANNAD 条目及其安装路径。",
-            "弹条「开始下载」→ 下载弹窗任务推进 → 「完成」→ 库中 CLANNAD 条目新增安装路径。",
+            "弹条「开始下载」→ 下载面板任务推进 → 「完成」→ 库中 CLANNAD 条目新增安装路径。",
             () => BuildValid()),
         new Scenario(
             "已过期链接",
@@ -55,6 +55,11 @@ internal static class TestPush
             "故意去掉 size 参数；解析阶段拒绝。",
             "弹错误「缺少或无效参数: size」。",
             () => BuildValid(omitSize: true)),
+        new Scenario(
+            "确认下载（自动下载关闭时）",
+            "先在插件设置里把「自动下载」关掉，再发送本用例（参数与 E2E 相同）。",
+            "弹出「确认下载」对话框；点击「下载」后才开始，点「取消」则忽略。",
+            () => BuildValid()),
     };
 
     private static string BuildValid(string? url = null, string? checksum = null,

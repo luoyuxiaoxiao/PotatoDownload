@@ -59,6 +59,7 @@ namespace PotatoVN.App.PluginBase
             InitUi();
 
             DownloadManager = new DownloadManager(_hostApi);
+            DownloadManager.ActiveTaskCountChanged += count => UpdateDownloadSidebarState(count);
             _pushService = new PushService(_hostApi, DevReportInfo);
             _pushService.RequestReceived += OnPushRequestReceived;
             _pushService.Start();
@@ -112,6 +113,17 @@ namespace PotatoVN.App.PluginBase
             _ = _hostApi.SaveDataAsync(dataJson);
         }
 
+        /// <summary>下载历史集合（持久化在插件数据里，随宿主保存）。</summary>
+        internal static System.Collections.ObjectModel.ObservableCollection<DownloadRecord> HistoryCollection =>
+            PluginDataInstance.History;
+
+        /// <summary>立即保存插件数据（用于历史记录等不触发 PropertyChanged 的修改）。</summary>
+        internal static void SaveDataNow()
+        {
+            var dataJson = System.Text.Json.JsonSerializer.Serialize(PluginDataInstance);
+            _ = HostApi.SaveDataAsync(dataJson);
+        }
+
         /// <summary>开发期错误上报。发布到应用市场前必须改为空实现，避免污染报错库。</summary>
         public async Task DevReportInfo(Exception? ex, string? msg)
         {
@@ -139,14 +151,76 @@ namespace PotatoVN.App.PluginBase
         {
             if (!_data.AutoDownload)
             {
-                _hostApi.Info(Microsoft.UI.Xaml.Controls.InfoBarSeverity.Informational,
-                    "PotatoDownload", $"收到推送（自动下载已关闭）: {request.Title}");
+                // 自动下载关闭：弹确认框，用户点击「下载」后才开始
+                EnqueueConfirmation(request);
                 return Task.CompletedTask;
             }
             _hostApi.Info(Microsoft.UI.Xaml.Controls.InfoBarSeverity.Informational,
                 "PotatoDownload", $"开始下载: {request.Title}");
             _ = DownloadManager.EnqueueAsync(request);
+            ShowDownloadDialog(); // Chrome 风格：新下载开始时直接呈现下载面板
             return Task.CompletedTask;
+        }
+
+        // ===== 确认下载（自动下载关闭时）=====
+        private readonly System.Collections.Concurrent.ConcurrentQueue<InstallRequest> _confirmQueue = new();
+        private bool _confirmDialogShowing;
+
+        private void EnqueueConfirmation(InstallRequest request)
+        {
+            _confirmQueue.Enqueue(request);
+            _hostApi.InvokeOnMainThread(() => _ = ShowNextConfirmationAsync());
+        }
+
+        /// <summary>逐个弹出确认框（ContentDialog 同一时刻只能显示一个）。</summary>
+        private async Task ShowNextConfirmationAsync()
+        {
+            if (_confirmDialogShowing) return;
+            if (!_confirmQueue.TryDequeue(out var request)) return;
+            var window = _hostApi.GetMainWindow();
+            if (window is null)
+            {
+                _hostApi.Info(Microsoft.UI.Xaml.Controls.InfoBarSeverity.Informational,
+                    "PotatoDownload", $"收到推送（自动下载已关闭）: {request.Title}");
+                return;
+            }
+            _confirmDialogShowing = true;
+            try
+            {
+                var dialog = new Microsoft.UI.Xaml.Controls.ContentDialog
+                {
+                    XamlRoot = window.Content.XamlRoot,
+                    Title = "确认下载",
+                    Content = $"游戏：{request.Title}\n" +
+                              $"文件：{request.FileName}（{Services.DownloadManager.FormatBytes((long)request.Size)}）\n" +
+                              $"来源：{new Uri(request.Url).Host}\n\n是否开始下载？",
+                    PrimaryButtonText = "下载",
+                    CloseButtonText = "取消",
+                    DefaultButton = Microsoft.UI.Xaml.Controls.ContentDialogButton.Primary,
+                };
+                var result = await dialog.ShowAsync();
+                if (result == Microsoft.UI.Xaml.Controls.ContentDialogResult.Primary)
+                {
+                    _hostApi.Info(Microsoft.UI.Xaml.Controls.InfoBarSeverity.Informational,
+                        "PotatoDownload", $"开始下载: {request.Title}");
+                    _ = DownloadManager.EnqueueAsync(request);
+                    ShowDownloadDialog();
+                }
+                else
+                {
+                    _hostApi.Log(Microsoft.UI.Xaml.Controls.InfoBarSeverity.Informational,
+                        $"PotatoDownload: user declined push ({request.Title})");
+                }
+            }
+            catch (Exception e)
+            {
+                _ = DevReportInfo(e, "ShowNextConfirmationAsync failed");
+            }
+            finally
+            {
+                _confirmDialogShowing = false;
+            }
+            if (!_confirmQueue.IsEmpty) await ShowNextConfirmationAsync();
         }
 
         protected Guid Id => Info.Id;

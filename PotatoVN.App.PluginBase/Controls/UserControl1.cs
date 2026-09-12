@@ -49,7 +49,7 @@ namespace PotatoVN.App.PluginBase.Controls
             var autoSwitch = new ToggleSwitch { IsOn = _data.AutoDownload };
             autoSwitch.Toggled += (_, _) => _data.AutoDownload = autoSwitch.IsOn;
             root.Children.Add(CreatePanel(new StdSetting("自动下载",
-                "收到推送后自动开始下载；关闭时仅提示收到推送", autoSwitch)));
+                "开启：收到推送立即下载；关闭：弹出确认框，点击「下载」后才开始", autoSwitch)));
 
             //数据被其他入口修改时同步回UI（设置项也可能来自推送流程之外的修改）
             _data.PropertyChanged += (_, e) => Plugin.HostApi.InvokeOnMainThread(() =>
