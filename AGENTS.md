@@ -72,6 +72,8 @@
 - 带 BOM 的 .cs 文件 file_editor 会误判为二进制，用 PowerShell ReadAllText 确认内容
 - BLAKE3 用 Blake3.Managed NuGet（纯托管）；SharpCompress 用 0.50.4（0.38 有漏洞 NU1902）
 - **插件绝不能订阅宿主进程静态事件**（AppInstance.Activated 等）：事件委托锁定插件程序集 → 更新/卸载时 DLL 删除失败（UnauthorizedAccessException）。改用轮询 IPotatoVnApi.ActivationArgs（宿主每次激活更新该属性）；后台 Task 停止时必须 await 完成并清空事件委托
+- **热激活（应用在运行/托盘时点深链）单靠轮询 GetActivatedEventArgs 捕获不到**（2026-09 用户实测：只见初始 Launch 参数或 COM 失效 0x800706BA）→ PushService 双通道轮询：sdk GetActivatedEventArgs + host ActivationArgs（宿主在激活回调里同步替换该属性，检测到引用变化必须立即读取，COM 代理可能已死）。宿主 DefaultActivationHandler 对任何激活都导航起始页——用户看到跳转"游戏"页 ≠ 插件收到了激活
+- **宿主 InfoService.Log 的 Informational/Success 级别和 DeveloperEvent 都会被 DevelopmentMode 开关过滤**：给普通用户排查必须用 Warning/Error 级别（始终落 Logs\log.txt）+ DevReportInfo 远程上报（PushService.ReportThrottled 限流）
 - **插件 UI 禁用 XAML，一律纯 C#**：插件 XAML 依赖宿主 v1.10.1+ 的 PluginXamlHost（注册插件 IXamlMetadataProvider + ms-appx 绝对路径 LoadComponent），旧宿主 CreateSettingUi 直接 XamlParseException（2026-09 用户实测崩溃）；不要调用 ResourceLoader.Initialize/加载 Styles 字典；C# 取主题资源用 PluginTheme（ResourceDictionary.TryGetValue 不进 ThemeDictionaries，需递归且必须带回退值）
 
 ### References
