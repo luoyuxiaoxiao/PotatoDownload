@@ -61,7 +61,8 @@
 - 精确刮削：构造 Galgame 设 `Ids[(int)RssType.Bangumi/Vndb/Hikarinagi]` → `AddVirtualGameAsync` 建占位 → `AddGameInstallation(path)` 关联路径（UID 精确命中）
 - 参考实现：ReinaManager `src-tauri/src/install/`（protocol/download/workflow），Shionlib `apps/frontend/components/game/download/helpers/reina.ts`
 - 下载架构：DownloadService 多线程分块（4 连接 × 4MB 块，Range 探测失败退化为单连接续传），.part + .part.watermark 断点续传；DownloadManager 串行队列 + ObservableCollection<DownloadTask> 供 UI 绑定
-- UI：侧边栏按钮"下载"→ ContentDialog 弹窗（DownloadProgressDialog.xaml，任务列表 + ProgressBar），无独立页面；设置页 UserControl1（下载目录 + 自动下载开关）
+- UI：侧边栏按钮"下载"→ ContentDialog 弹窗（DownloadProgressDialog，纯C#），无独立页面；设置页 UserControl1（纯C#，下载目录 + 自动下载开关）；主题资源查找走 Helper/PluginTheme
+- DevReportInfo 已在 Plugin.cs 实现（上传到应用市场/正式版前必须改为空实现）
 
 ### Feedback / Lessons
 <!-- 用户纠正过的做法 + 原因。例：- 不要 mock 数据库测试，原因：上次 mock 通过但生产迁移失败 -->
@@ -71,6 +72,7 @@
 - 带 BOM 的 .cs 文件 file_editor 会误判为二进制，用 PowerShell ReadAllText 确认内容
 - BLAKE3 用 Blake3.Managed NuGet（纯托管）；SharpCompress 用 0.50.4（0.38 有漏洞 NU1902）
 - **插件绝不能订阅宿主进程静态事件**（AppInstance.Activated 等）：事件委托锁定插件程序集 → 更新/卸载时 DLL 删除失败（UnauthorizedAccessException）。改用轮询 IPotatoVnApi.ActivationArgs（宿主每次激活更新该属性）；后台 Task 停止时必须 await 完成并清空事件委托
+- **插件 UI 禁用 XAML，一律纯 C#**：插件 XAML 依赖宿主 v1.10.1+ 的 PluginXamlHost（注册插件 IXamlMetadataProvider + ms-appx 绝对路径 LoadComponent），旧宿主 CreateSettingUi 直接 XamlParseException（2026-09 用户实测崩溃）；不要调用 ResourceLoader.Initialize/加载 Styles 字典；C# 取主题资源用 PluginTheme（ResourceDictionary.TryGetValue 不进 ThemeDictionaries，需递归且必须带回退值）
 
 ### References
 <!-- 外部资源指针。例：- 报错日志查 Grafana: grafana.internal/d/plugin-runtime -->
