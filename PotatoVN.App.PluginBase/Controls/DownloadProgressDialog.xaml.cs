@@ -14,5 +14,14 @@ public sealed partial class DownloadProgressDialog : UserControl
     {
         XamlResourceLocatorFactory.PluginControlInit(ref _contentLoaded, this);
         TaskList.ItemsSource = Plugin.DownloadManager.Tasks;
+        Plugin.DownloadManager.Tasks.CollectionChanged += (_, _) => UpdateVisibility();
+        UpdateVisibility();
+    }
+
+    private void UpdateVisibility()
+    {
+        var hasTasks = Plugin.DownloadManager.Tasks.Count > 0;
+        TaskList.Visibility = hasTasks ? Visibility.Visible : Visibility.Collapsed;
+        EmptyText.Visibility = hasTasks ? Visibility.Collapsed : Visibility.Visible;
     }
 }

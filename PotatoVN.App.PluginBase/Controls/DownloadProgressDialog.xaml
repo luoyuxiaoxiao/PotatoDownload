@@ -8,9 +8,9 @@
     mc:Ignorable="d"
     MinWidth="420">
 
-    <StackPanel Spacing="12">
-        <TextBlock Text="下载任务" FontSize="18" FontWeight="SemiBold" />
-        <ListView x:Name="TaskList" MaxHeight="320" SelectionMode="None">
+    <StackPanel Spacing="12" MinHeight="120">
+        <ListView x:Name="TaskList" MaxHeight="320" SelectionMode="None"
+                  Visibility="Collapsed">
             <ListView.ItemTemplate>
                 <DataTemplate>
                     <StackPanel Spacing="6" Padding="0,4">
@@ -29,5 +29,8 @@
                 </DataTemplate>
             </ListView.ItemTemplate>
         </ListView>
+        <TextBlock x:Name="EmptyText" Text="当前没有下载任务"
+                   HorizontalAlignment="Center" VerticalAlignment="Center"
+                   Foreground="{ThemeResource TextFillColorSecondaryBrush}" />
     </StackPanel>
 </UserControl>

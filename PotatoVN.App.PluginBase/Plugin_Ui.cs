@@ -39,7 +39,6 @@ public partial class Plugin : IGalgamePageLeftPanel, IGalgamePageRightPanel
             var dialog = new ContentDialog
             {
                 XamlRoot = window.Content.XamlRoot,
-                Title = "PotatoDownload",
                 Content = new DownloadProgressDialog(),
                 CloseButtonText = "关闭",
                 DefaultButton = ContentDialogButton.Close,
