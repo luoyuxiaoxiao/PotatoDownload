@@ -67,7 +67,7 @@
 - 断点续传坑：.part+水位在失败中断后会残留；DownloadAsync 开头对"水位与文件大小都达预期"的 .part 直接复用跳过下载；DownloadSequentialAsync 里 committed>0 但响应不是 206（服务端忽略 Range 整包返回）必须清零从头覆盖，否则重复追加成 2 倍大小（2026-09 实测 363→726）
 - 下载历史持久化在 PluginData.History（get-only ObservableCollection，STJ 可 populate；集合变更不触发 PropertyChanged，需 Plugin.SaveDataNow() 手动保存）；侧边栏按钮状态切换靠 Unregister+Register（宿主无原地更新接口）
 - DevReportInfo 自 v0.1.0 起为空实现（plan/main 一致）；需要远程诊断时临时恢复上报，发布前改回
-- 测验网站：repo/docs/index.html，GitHub Pages 从 plan 分支 /docs 发布（https://luoyuxiaoxiao.github.io/PotatoDownload/），也可 file:// 直开；构链/触发逻辑逐字移植 Shionlib helpers/{protocol,potatovn}.ts（URLSearchParams 编码 + 隐藏 a 点击 + 可调"签名等待"延时），**移植段不要改**，测试开关（provider 覆盖/缺参/不校验/密码/格式覆盖）只在 buildInstallUrl 包装层（等价性自检 `Tests/SiteCheck/check.ts`，deno 对照本机 Shionlib 克隆逐字节比对，改页面构链后必跑）；载荷 docs/payload/test_game.zip 经 Pages 公网直链下发（SSRF 修复后本地服务器不可用），改载荷后跑 make-payload.ps1 并更新页面 PAYLOAD 常量；宿主侧安装入口：插件页"从本地压缩包安装"（AddPluginFromLocalZip）
+- 测验网站：repo/docs/index.html，GitHub Pages 从 plan 分支 /docs 发布（https://luoyuxiaoxiao.github.io/PotatoDownload/，**docs/.nojekyll 必须保留**——没有它 Jekyll 构建直接失败 2026-09-13 实证；Pages 支持 Range 回 206，构建约 1 分钟），也可 file:// 直开；构链/触发逻辑逐字移植 Shionlib helpers/{protocol,potatovn}.ts（URLSearchParams 编码 + 隐藏 a 点击 + 可调"签名等待"延时），**移植段不要改**，测试开关（provider 覆盖/缺参/不校验/密码/格式覆盖）只在 buildInstallUrl 包装层（等价性自检 `Tests/SiteCheck/check.ts`，deno 对照本机 Shionlib 克隆逐字节比对，改页面构链后必跑）；载荷 docs/payload/test_game.zip 经 Pages 公网直链下发（SSRF 修复后本地服务器不可用），改载荷后跑 make-payload.ps1 并更新页面 PAYLOAD 常量；宿主侧安装入口：插件页"从本地压缩包安装"（AddPluginFromLocalZip）
 - 插件内推送测试（侧边栏按钮/TestPushDialog/Helper/TestPush.cs）已于 2026-09-13 移除，测验统一走 docs 网站，发布前不再需要删测试代码
 
 ### Feedback / Lessons
