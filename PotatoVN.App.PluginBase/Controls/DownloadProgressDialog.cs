@@ -1,6 +1,5 @@
 using System;
 using System.Collections.Specialized;
-using System.ComponentModel;
 using Microsoft.UI.Text;
 using Microsoft.UI.Xaml;
 using Microsoft.UI.Xaml.Controls;
@@ -14,6 +13,7 @@ namespace PotatoVN.App.PluginBase.Controls;
 /// <summary>
 /// 下载面板（对齐 Chrome 下载页）：上方「进行中」实时任务（进度条 + 速度 + 完成度），
 /// 下方「历史记录」（持久化的完成/失败记录，含时间与结果）。纯 C# 构建。
+/// 所有者在弹窗关闭后必须调用 <see cref="Detach"/>。
 /// </summary>
 public sealed class DownloadProgressDialog : UserControl
 {
@@ -30,7 +30,7 @@ public sealed class DownloadProgressDialog : UserControl
     /// <summary>
     /// 进度轮询计时器：PropertyChanged→InvokeOnMainThread 链路在宿主环境被实证不可靠（面板冻结、
     /// 只在打开瞬间显示一次快照），改为在 UI 线程上每 500ms 直接读任务模型刷新——
-    /// 只要弹窗能打开，这条路一定走。
+    /// 只要弹窗能打开，这条路一定走。任务模型不再发事件，面板是唯一的读取方。
     /// </summary>
     private readonly DispatcherTimer _refreshTimer = new() { Interval = TimeSpan.FromMilliseconds(500) };
 
@@ -67,16 +67,21 @@ public sealed class DownloadProgressDialog : UserControl
 
         Plugin.DownloadManager.Tasks.CollectionChanged += OnCollectionChanged;
         Plugin.HistoryCollection.CollectionChanged += OnCollectionChanged;
-        Unloaded += (_, _) =>
-        {
-            _refreshTimer.Stop();
-            Plugin.DownloadManager.Tasks.CollectionChanged -= OnCollectionChanged;
-            Plugin.HistoryCollection.CollectionChanged -= OnCollectionChanged;
-            DetachRows(_activePanel);
-        };
         Rebuild();
         _refreshTimer.Tick += OnRefreshTick;
         _refreshTimer.Start();
+    }
+
+    /// <summary>
+    /// 停表 + 退订集合事件。由弹窗所有者在 ShowAsync 返回后调用（Plugin_Ui），
+    /// 不依赖 Loaded/Unloaded/IsLoaded：ContentDialog 内容关闭时未必触发 Unloaded，打开过程中又可能虚发一次——
+    /// 之前按 Unloaded 拆订阅/停表，面板就只剩打开瞬间的一张快照。重复调用无害。
+    /// </summary>
+    internal void Detach()
+    {
+        _refreshTimer.Stop();
+        Plugin.DownloadManager.Tasks.CollectionChanged -= OnCollectionChanged;
+        Plugin.HistoryCollection.CollectionChanged -= OnCollectionChanged;
     }
 
     private static TextBlock CreateHeader(string text) => new()
@@ -113,22 +118,16 @@ public sealed class DownloadProgressDialog : UserControl
         return grid;
     }
 
-    private void OnCollectionChanged(object? sender, NotifyCollectionChangedEventArgs e) =>
-        Plugin.HostApi.InvokeOnMainThread(Rebuild);
+    /// <summary>两个集合都只在主线程改动，事件也在主线程到达；直接重建即可。</summary>
+    private void OnCollectionChanged(object? sender, NotifyCollectionChangedEventArgs e) => Rebuild();
 
-    /// <summary>每 500ms 在 UI 线程上直接读任务模型刷新行；任务数变化时顺手重建（移出已完成行）。</summary>
+    /// <summary>每 500ms 在 UI 线程上直接读任务模型刷新行；列出的任务数变化时顺手重建（移出已完成行）。</summary>
     private void OnRefreshTick(object? sender, object e)
     {
-        if (!IsLoaded)
-        {
-            // ContentDialog 关闭后内容未必触发 Unloaded：自查失活即停，避免计时器泄漏
-            _refreshTimer.Stop();
-            return;
-        }
-        var active = 0;
+        var listed = 0;
         foreach (var task in Plugin.DownloadManager.Tasks)
-            if (task.IsListed) active++;
-        if (active != _activePanel.Children.Count)
+            if (task.IsListed) listed++;
+        if (listed != _activePanel.Children.Count)
         {
             Rebuild();
             return;
@@ -137,15 +136,8 @@ public sealed class DownloadProgressDialog : UserControl
             if (child is TaskRow row) row.Refresh();
     }
 
-    private static void DetachRows(Panel panel)
-    {
-        foreach (var child in panel.Children)
-            if (child is TaskRow row) row.Detach();
-    }
-
     private void Rebuild()
     {
-        DetachRows(_activePanel);
         _activePanel.Children.Clear();
         var activeCount = 0;
         foreach (var task in Plugin.DownloadManager.Tasks)
@@ -243,7 +235,7 @@ public sealed class DownloadProgressDialog : UserControl
             : cancelled ? "TextFillColorSecondaryBrush" : "SystemFillColorCriticalBrush");
 
         var grid = TwoColumnGrid();
-        grid.Children.Add(Glyph(ok ? "" : "", glyphBrush));
+        grid.Children.Add(Glyph(ok ? "" : "", glyphBrush));
 
         var textStack = new StackPanel { Spacing = 2, Margin = new Thickness(10, 0, 10, 0) };
         Grid.SetColumn(textStack, 1);
@@ -276,7 +268,7 @@ public sealed class DownloadProgressDialog : UserControl
         return Card(grid);
     }
 
-    /// <summary>活动任务行：图标 + 标题/状态 + 进度条 + 速度/完成度。</summary>
+    /// <summary>活动任务行：图标 + 标题/状态 + 进度条 + 速度/完成度 + 暂停/继续/取消。速度 = 每次刷新的字节增量做 EMA 平滑。</summary>
     private sealed class TaskRow : UserControl
     {
         private readonly DownloadTask _task;
@@ -286,6 +278,9 @@ public sealed class DownloadProgressDialog : UserControl
         private readonly Button _pauseButton;
         private readonly Button _resumeButton;
         private readonly Button _cancelButton;
+        private long _lastBytes;
+        private DateTimeOffset _lastTick;
+        private double _speed;
 
         /// <summary>Chrome 下载行风格的小图标按钮。</summary>
         private static Button IconButton(Symbol symbol, string tooltip)
@@ -305,9 +300,11 @@ public sealed class DownloadProgressDialog : UserControl
         public TaskRow(DownloadTask task)
         {
             _task = task;
+            _lastBytes = task.Received;
+            _lastTick = DateTimeOffset.UtcNow;
 
             var grid = TwoColumnGrid();
-            grid.Children.Add(Glyph(""));
+            grid.Children.Add(Glyph(""));
 
             var centerStack = new StackPanel { Spacing = 2, Margin = new Thickness(10, 0, 10, 0) };
             Grid.SetColumn(centerStack, 1);
@@ -337,14 +334,20 @@ public sealed class DownloadProgressDialog : UserControl
             _pauseButton = IconButton(Symbol.Pause, "暂停");
             _resumeButton = IconButton(Symbol.Play, "继续");
             _cancelButton = IconButton(Symbol.Cancel, "取消");
-            _pauseButton.Click += (_, _) => _task.Pause();
-            _resumeButton.Click += (_, _) => Plugin.DownloadManager.ResumeTask(_task);
+            _pauseButton.Click += (_, _) =>
+            {
+                _task.Pause();
+                Refresh();
+            };
+            _resumeButton.Click += (_, _) =>
+            {
+                Plugin.DownloadManager.ResumeTask(_task);
+                Refresh();
+            };
             _cancelButton.Click += (_, _) =>
             {
-                if (_task.Stage == DownloadTaskStage.Paused)
-                    Plugin.DownloadManager.CancelPausedTask(_task);
-                else
-                    _task.Cancel();
+                Plugin.DownloadManager.CancelTask(_task);
+                Refresh();
             };
             var buttonStack = new StackPanel
             {
@@ -361,30 +364,44 @@ public sealed class DownloadProgressDialog : UserControl
             grid.Children.Add(rightStack);
 
             Content = Card(grid);
-
             Refresh();
-            _task.PropertyChanged += OnTaskPropertyChanged;
         }
-
-        public void Detach() => _task.PropertyChanged -= OnTaskPropertyChanged;
-
-        private void OnTaskPropertyChanged(object? sender, PropertyChangedEventArgs e) =>
-            Plugin.HostApi.InvokeOnMainThread(Refresh);
 
         internal void Refresh()
         {
-            _messageText.Text = _task.Message;
+            var stage = _task.Stage;
+            var received = _task.Received;
+            var downloading = stage == DownloadTaskStage.Downloading;
+            var now = DateTimeOffset.UtcNow;
+            var seconds = (now - _lastTick).TotalSeconds;
+            if (!downloading)
+            {
+                _speed = 0;
+            }
+            else if (seconds >= 0.25)
+            {
+                // 每次刷新的增量算瞬时速度再 EMA 平滑；增量为 0 时速度自然衰减，停滞一眼可见。重试导致的回退按 0 计
+                var instant = Math.Max(0, received - _lastBytes) / seconds;
+                _speed = _speed <= 0 ? instant : _speed * 0.7 + instant * 0.3;
+            }
+            _lastBytes = received;
+            _lastTick = now;
+
+            // 已请求但流程尚未收尾：按钮立即反馈，不等下一轮
+            var interrupting = _task.CancelRequest != CancelRequestKind.None && _task.IsActive;
+            _messageText.Text = interrupting
+                ? (_task.CancelRequest == CancelRequestKind.Cancel ? "取消中…" : "暂停中…")
+                : downloading
+                    ? $"下载中 {DownloadManager.FormatBytes(received)} / {DownloadManager.FormatBytes(_task.Total)}"
+                    : _task.Message;
             _progressBar.Value = _task.ProgressPercent;
-            // 进度回调停滞超过 2 秒时速度归零显示：肉眼即可分辨「下载侧停滞」与「显示侧冻结」
-            var stalled = _task.Stage == DownloadTaskStage.Downloading
-                && (DateTimeOffset.UtcNow - _task.LastProgressUtc).TotalSeconds > 2;
-            var speed = stalled ? 0 : (long)_task.SpeedBytesPerSec;
-            _rightText.Text = _task.Stage == DownloadTaskStage.Downloading && _task.Total > 0
-                ? $"{_task.ProgressPercent:F0}% · {DownloadManager.FormatBytes(speed)}/s"
-                : StageText(_task.Stage);
-            _pauseButton.Visibility = _task.IsActive ? Visibility.Visible : Visibility.Collapsed;
-            _resumeButton.Visibility = _task.Stage == DownloadTaskStage.Paused ? Visibility.Visible : Visibility.Collapsed;
-            _cancelButton.Visibility = _task.IsListed ? Visibility.Visible : Visibility.Collapsed;
+            _rightText.Text = downloading && _task.Total > 0
+                ? $"{_task.ProgressPercent:F0}% · {DownloadManager.FormatBytes((long)_speed)}/s"
+                : StageText(stage);
+            _pauseButton.Visibility = _task.IsActive && !interrupting ? Visibility.Visible : Visibility.Collapsed;
+            _resumeButton.Visibility = stage == DownloadTaskStage.Paused ? Visibility.Visible : Visibility.Collapsed;
+            _cancelButton.Visibility = _task.IsListed && _task.CancelRequest != CancelRequestKind.Cancel
+                ? Visibility.Visible : Visibility.Collapsed;
         }
     }
 }
