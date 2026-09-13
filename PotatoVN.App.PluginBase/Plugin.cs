@@ -63,44 +63,8 @@ namespace PotatoVN.App.PluginBase
             _pushService = new PushService(_hostApi, DevReportInfo);
             _pushService.RequestReceived += OnPushRequestReceived;
             _pushService.Start();
-            ReportHostApiSurface();
         }
 
-        /// <summary>开发期：探测宿主实际提供的插件 API 面并上报一次（宿主各版本差异很大）。</summary>
-        private void ReportHostApiSurface()
-        {
-            try
-            {
-                string[] probe =
-                [
-                    "GetGameByUid", "GetGameById", "AddVirtualGameAsync", "AddSourceAsync",
-                    "AddGameToSource", "SaveGameAsync", "InvokeOnMainThreadAsync",
-                    "GetAllGames", "AddVirtualGame", "AddGameInstallation",
-                    "RegisterSidebarButton", "GetMainWindow",
-                ];
-                var present = new System.Text.StringBuilder();
-                var missing = new System.Text.StringBuilder();
-                foreach (var name in probe)
-                {
-                    var found = false;
-                    foreach (var method in _hostApi.GetType().GetMethods())
-                    {
-                        if (method.Name == name)
-                        {
-                            found = true;
-                            break;
-                        }
-                    }
-                    (found ? present : missing).Append(name).Append(',');
-                }
-                _ = DevReportInfo(null, $"host api surface present=[{present}] missing=[{missing}]");
-            }
-            catch
-            {
-                // 探测失败无关紧要
-            }
-        }
-        
         public async Task OnUninstallAsync(bool deleteData, Action<TimeSpan> extendWaitHandler, CancellationToken cts)
         {
             if (cts.IsCancellationRequested) return;
@@ -129,28 +93,11 @@ namespace PotatoVN.App.PluginBase
             _ = HostApi.SaveDataAsync(dataJson);
         }
 
-        /// <summary>开发期错误上报。发布到应用市场前必须改为空实现，避免污染报错库。</summary>
-        public async Task DevReportInfo(Exception? ex, string? msg)
-        {
-            try
-            {
-                var body = new
-                {
-                    message = msg ?? ex?.Message,
-                    stack_trace = ex?.StackTrace,
-                };
-                using var content = new System.Net.Http.StringContent(
-                    System.Text.Json.JsonSerializer.Serialize(body),
-                    System.Text.Encoding.UTF8,
-                    "application/json");
-                await new System.Net.Http.HttpClient().PostAsync(
-                    $"https://plugin.potatovn.net/api/vibe/plugins/{Id}/runtime-errors", content);
-            }
-            catch
-            {
-                //上报失败不应影响插件本体
-            }
-        }
+        /// <summary>
+        /// 开发期错误上报。正式版为空实现（避免污染报错库）；
+        /// 开发调试时恢复为向 https://plugin.potatovn.net/api/vibe/plugins/{Id}/runtime-errors POST 的实现。
+        /// </summary>
+        public Task DevReportInfo(Exception? ex, string? msg) => Task.CompletedTask;
 
         private Task OnPushRequestReceived(InstallRequest request)
         {

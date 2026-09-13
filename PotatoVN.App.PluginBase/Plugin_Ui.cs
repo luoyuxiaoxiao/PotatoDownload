@@ -55,18 +55,6 @@ public partial class Plugin : IGalgamePageLeftPanel, IGalgamePageRightPanel
     {
         if (_uiInit) return;
         UpdateDownloadSidebarState(0);
-        // 开发期测试入口：发布应用市场前必须移除
-        _hostApi.RegisterSidebarButton(new SidebarButtonInfo
-        {
-           Id = "potato-download-test-push",
-           Text = "推送测试",
-           Placement = SidebarButtonPlacement.Menu,
-           FluentGlyph = "&#xE71B;",
-        }, () =>
-        {
-            ShowTestPushDialog();
-            return Task.CompletedTask;
-        });
         _uiInit = true;
     }
 
@@ -98,28 +86,6 @@ public partial class Plugin : IGalgamePageLeftPanel, IGalgamePageRightPanel
             {
                 _ = DevReportInfo(e, "UpdateDownloadSidebarState failed");
             }
-        });
-    }
-
-    /// <summary>弹出推送测试面板（模态，经串行协调器）。</summary>
-    private void ShowTestPushDialog()
-    {
-        _hostApi.InvokeOnMainThread(() =>
-        {
-            var window = _hostApi.GetMainWindow();
-            if (window is null) return;
-            EnqueueDialog(async () =>
-            {
-                var dialog = new ContentDialog
-                {
-                    XamlRoot = window.Content.XamlRoot,
-                    Title = "PotatoDownload 推送测试",
-                    Content = new TestPushDialog(DevReportInfo),
-                    CloseButtonText = "关闭",
-                    DefaultButton = ContentDialogButton.Close,
-                };
-                await dialog.ShowAsync();
-            });
         });
     }
 
