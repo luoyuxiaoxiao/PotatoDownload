@@ -88,6 +88,8 @@
 - **静态事件订阅的安全做法**（旧规则"绝不订阅"源于未做清理时的 DLL 锁定 UnauthorizedAccessException）：StopAsync 必须 退订 + GC.Collect×2/WaitForPendingFinalizers 释放 WinRT CCW + await 后台 Task 停止 + 清空事件委托；验证方式：插件热更新/卸载一次看是否再报文件占用
 - **宿主 InfoService.Log 的 Informational/Success 级别和 DeveloperEvent 都会被 DevelopmentMode 开关过滤**：给普通用户排查必须用 Warning/Error 级别（始终落 Logs\log.txt）+ DevReportInfo 远程上报（PushService.ReportThrottled 限流）
 - **工作区可能被平台重置**（2026-09-13 实例：工作树被重置为 main 的 Initial commit，源文件全删，但 plan 分支的 git 对象幸存 → git checkout plan 一键全恢复；obj/Stamped 也可作最后退路）。教训：关键节点勤 push 到远程，不要只依赖本地提交
+- **pull 撞车模式（2026-09-13 实证）**：收尾协议写 AGENTS.md 记忆区后不 commit 就走人，下次 pull 远端也改了 AGENTS.md → git 拒绝对脏文件合并报"local changes would be overwritten"。解法：stash → 此时必为 fast-forward merge → stash pop（记忆区追加行与远端修改通常不同 hunk，自动合并）。收尾更新记忆后应顺手 commit
+- 平台初始 fetch refspec 只映射 main（无 origin/plan 跟踪引用）；已补 `+refs/heads/plan:refs/remotes/origin/plan`。用户在 Windows 机做完修复会同时推 main 和 plan（两分支常指同一提交）
 - 公共 base64 echo 端点只有 `httpbingo.org/base64/{base64url}` 字节级可靠（2026-09 实测 sha256 完全一致）；httpbin.org 的 /base64 对含 `+`/`/` 的标准 base64 一律 404（百分号编码也不行）——构造测试下载地址别用 httpbin
 - **插件 UI 禁用 XAML，一律纯 C#**：插件 XAML 依赖宿主 v1.10.1+ 的 PluginXamlHost（注册插件 IXamlMetadataProvider + ms-appx 绝对路径 LoadComponent），旧宿主 CreateSettingUi 直接 XamlParseException（2026-09 用户实测崩溃）；不要调用 ResourceLoader.Initialize/加载 Styles 字典；C# 取主题资源用 PluginTheme（ResourceDictionary.TryGetValue 不进 ThemeDictionaries，需递归且必须带回退值）
 
