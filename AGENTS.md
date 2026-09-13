@@ -88,6 +88,9 @@
 <!-- 外部资源指针。例：- 报错日志查 Grafana: grafana.internal/d/plugin-runtime -->
 - Shionlib 仓库：github.com/Ringyuki/shionlib；ReinaManager：github.com/huoshen80/ReinaManager
 - 本插件远程仓库：github.com/luoyuxiaoxiao/PotatoDownload（main 与 plan 均已推送；用户明确要求 push 到 main）
+- **分支分工（用户约定）：plan=开发线（保留推送测试功能），main=发布线（无测试功能，DevReportInfo 空实现）**；v0.1.0 已发布到应用市场（tag v0.1.0，包页 plugin.api.potatovn.net/pvn-plugin/package/dfb57882-7b2f-4db3-8fe8-5f3517d1f4c8/0.1.0）
+- publish_plugin 流程：build_plugin → upload_test_build 拿 artifact_id → publish_plugin(artifact_id, version, changelog, plugin_info)；**首次发布必须先随调用提交 plugin_info**（name/description/author/homepage），否则 400 "Plugin info must be submitted before publishing"
+- 后续计划：推送测试拆成独立插件（新插件 ID/工作区）；Shionlib 上游支持（其前端加 PotatoVN 按钮，scheme 换 potato-vn:// 参数兼容）
 - 默认下载目录：系统盘 Galgame 文件夹（Plugin.DefaultDownloadPath，Path.GetPathRoot(Environment.SystemDirectory)，一定存在；留空设置项时的回退）
 
 <!-- MEMORY END -->
