@@ -296,9 +296,10 @@ internal static class Program
         var flat = Path.Combine(dir, "flat.zip");
         MakeZip(flat, ("a.txt", "a"), ("b.txt", "b"));
         Check(UnpackService.ResolveGameDirectoryName(req, flat) == "flat", "resolve: multiple top-level entries fall back to stem");
-        var con = Path.Combine(dir, "con.zip");
+        // 不能命名为 con.zip：Windows 保留设备名写入不落盘，读取得到非 seekable 流
+        var con = Path.Combine(dir, "reserved.zip");
         MakeZip(con, ("CON/a.txt", "a"));
-        Check(UnpackService.ResolveGameDirectoryName(req, con) == "game", "resolve: reserved names fall back to 'game'");
+        Check(UnpackService.ResolveGameDirectoryName(req, con) == "reserved", "resolve: reserved top-level name falls back to archive stem");
         var weird = Path.Combine(dir, "..zip");
         MakeZip(weird, ("a.txt", "a"), ("b.txt", "b"));
         Check(UnpackService.ResolveGameDirectoryName(req, weird) == "game", "resolve: unsafe stem '.' falls back to 'game'");
