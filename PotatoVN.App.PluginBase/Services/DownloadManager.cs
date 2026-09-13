@@ -28,7 +28,8 @@ public partial class DownloadTask : ObservableObject
     public InstallRequest Request { get; }
     public string Title => Request.Title;
 
-    /// <summary>用户取消令牌：入队时与插件级 Shutdown 令牌链接；取消后 .part 与水位保留，重推可续传。</summary>
+    /// <summary>用户取消令牌：入队时与插件级 Shutdown 令牌链接。
+    /// 用户主动取消会删除 .part/水位与未完成目录；插件停止（Shutdown）才保留续传现场。</summary>
     public CancellationTokenSource Cts { get; } = new();
 
     [ObservableProperty] private DownloadTaskStage _stage = DownloadTaskStage.Pending;
@@ -140,6 +141,45 @@ public class DownloadManager
         }
     }
 
+    /// <summary>
+    /// 用户主动取消后的清理：删除暂存压缩包/.part/水位，以及带未完成标记的自建游戏目录
+    /// （没有标记的目录不是本插件创建/已完成的，绝不动）。尽力而为，残留无碍。
+    /// </summary>
+    private void CleanupCancelledArtifacts(string? packPath, string? gamePath)
+    {
+        try
+        {
+            if (gamePath is not null && Directory.Exists(gamePath)
+                && File.Exists(Path.Combine(gamePath, UnpackService.IncompleteMarker)))
+            {
+                Directory.Delete(gamePath, true);
+            }
+            if (packPath is not null)
+            {
+                TryDeleteFile(packPath);
+                TryDeleteFile(packPath + ".part");
+                TryDeleteFile(packPath + ".part.watermark");
+            }
+        }
+        catch (Exception e)
+        {
+            _hostApi.Log(InfoBarSeverity.Warning,
+                $"PotatoDownload: cleanup after cancel failed: {e.Message}");
+        }
+    }
+
+    private static void TryDeleteFile(string path)
+    {
+        try
+        {
+            if (File.Exists(path)) File.Delete(path);
+        }
+        catch
+        {
+            // 单个文件删不掉（占用等）不影响其余清理
+        }
+    }
+
     private Task<DownloadTask?> AddTaskAsync(InstallRequest request)
     {
         var added = new TaskCompletionSource<DownloadTask?>(TaskCreationOptions.RunContinuationsAsynchronously);
@@ -183,6 +223,8 @@ public class DownloadManager
 
     private async Task ProcessAsync(DownloadTask task, CancellationToken ct)
     {
+        string? packPath = null;
+        string? gamePath = null;
         try
         {
             // 1. 下载目录：设置项，或系统盘 Galgame 文件夹（自动创建）。
@@ -192,7 +234,7 @@ public class DownloadManager
                 : Plugin.DownloadPath;
             var stagingDir = Path.Combine(downloadDir, ".potatodownload");
             Directory.CreateDirectory(stagingDir);
-            var packPath = Path.Combine(stagingDir, task.Request.FileName);
+            packPath = Path.Combine(stagingDir, task.Request.FileName);
 
             // 2. 下载（多线程分块 + 断点续传），速度做 EMA 平滑，UI 更新限流 500ms
             task.Stage = DownloadTaskStage.Downloading;
@@ -243,7 +285,7 @@ public class DownloadManager
             task.Stage = DownloadTaskStage.Unpacking;
             task.Message = "解压中...";
             var gameDirName = UnpackService.ResolveGameDirectoryName(task.Request, packPath);
-            var gamePath = UnpackService.PrepareGameDirectory(downloadDir, gameDirName);
+            gamePath = UnpackService.PrepareGameDirectory(downloadDir, gameDirName);
             await UnpackService.UnpackAsync(task.Request, packPath, gamePath,
                 (finished, total) => task.Message = total > 0 ? $"解压中 {finished}/{total}" : $"解压中 {finished} 个文件",
                 ct);
@@ -268,6 +310,9 @@ public class DownloadManager
         catch (OperationCanceledException) when (ct.IsCancellationRequested)
         {
             FinishCancelled(task);
+            // 用户主动取消 = 放弃这个文件：清掉暂存与未完成目录；插件停止则保留现场可续传
+            if (task.Cts.IsCancellationRequested && !_shutdown.IsCancellationRequested)
+                CleanupCancelledArtifacts(packPath, gamePath);
         }
         catch (Exception e)
         {

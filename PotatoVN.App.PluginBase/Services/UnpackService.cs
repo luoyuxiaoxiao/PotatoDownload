@@ -21,7 +21,7 @@ public static class UnpackService
     /// 解压未完成标记：只有带此标记的目录（本插件上次没做完的解压）才会在重试时被清理重建；
     /// 用户已有的同名目录一律不动。解压入库全部完成后由 <see cref="MarkComplete"/> 移除。
     /// </summary>
-    private const string IncompleteMarker = ".potatodownload-incomplete";
+    internal const string IncompleteMarker = ".potatodownload-incomplete";
 
     /// <summary>
     /// 解压压缩包到目标目录。

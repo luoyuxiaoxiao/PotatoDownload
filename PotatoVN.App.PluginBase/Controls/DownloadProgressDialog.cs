@@ -1,3 +1,4 @@
+using System;
 using System.Collections.Specialized;
 using System.ComponentModel;
 using Microsoft.UI.Text;
@@ -25,6 +26,13 @@ public sealed class DownloadProgressDialog : UserControl
     private readonly FrameworkElement _historyHeader;
     private readonly TextBlock _emptyText;
     private bool _historyExpanded;
+
+    /// <summary>
+    /// 进度轮询计时器：PropertyChanged→InvokeOnMainThread 链路在宿主环境被实证不可靠（面板冻结、
+    /// 只在打开瞬间显示一次快照），改为在 UI 线程上每 500ms 直接读任务模型刷新——
+    /// 只要弹窗能打开，这条路一定走。
+    /// </summary>
+    private readonly DispatcherTimer _refreshTimer = new() { Interval = TimeSpan.FromMilliseconds(500) };
 
     public DownloadProgressDialog()
     {
@@ -61,11 +69,14 @@ public sealed class DownloadProgressDialog : UserControl
         Plugin.HistoryCollection.CollectionChanged += OnCollectionChanged;
         Unloaded += (_, _) =>
         {
+            _refreshTimer.Stop();
             Plugin.DownloadManager.Tasks.CollectionChanged -= OnCollectionChanged;
             Plugin.HistoryCollection.CollectionChanged -= OnCollectionChanged;
             DetachRows(_activePanel);
         };
         Rebuild();
+        _refreshTimer.Tick += OnRefreshTick;
+        _refreshTimer.Start();
     }
 
     private static TextBlock CreateHeader(string text) => new()
@@ -104,6 +115,27 @@ public sealed class DownloadProgressDialog : UserControl
 
     private void OnCollectionChanged(object? sender, NotifyCollectionChangedEventArgs e) =>
         Plugin.HostApi.InvokeOnMainThread(Rebuild);
+
+    /// <summary>每 500ms 在 UI 线程上直接读任务模型刷新行；任务数变化时顺手重建（移出已完成行）。</summary>
+    private void OnRefreshTick(object? sender, object e)
+    {
+        if (!IsLoaded)
+        {
+            // ContentDialog 关闭后内容未必触发 Unloaded：自查失活即停，避免计时器泄漏
+            _refreshTimer.Stop();
+            return;
+        }
+        var active = 0;
+        foreach (var task in Plugin.DownloadManager.Tasks)
+            if (task.IsActive) active++;
+        if (active != _activePanel.Children.Count)
+        {
+            Rebuild();
+            return;
+        }
+        foreach (var child in _activePanel.Children)
+            if (child is TaskRow row) row.Refresh();
+    }
 
     private static void DetachRows(Panel panel)
     {
@@ -313,7 +345,7 @@ public sealed class DownloadProgressDialog : UserControl
         private void OnTaskPropertyChanged(object? sender, PropertyChangedEventArgs e) =>
             Plugin.HostApi.InvokeOnMainThread(Refresh);
 
-        private void Refresh()
+        internal void Refresh()
         {
             _messageText.Text = _task.Message;
             _progressBar.Value = _task.ProgressPercent;
