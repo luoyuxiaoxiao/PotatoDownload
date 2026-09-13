@@ -2,6 +2,7 @@ using System;
 using System.IO;
 using System.Linq;
 using System.Net;
+using System.Net.Sockets;
 using System.Text.RegularExpressions;
 
 namespace PotatoVN.App.PluginBase.Models;
@@ -14,12 +15,24 @@ public class InstallRequest
     public const uint SupportedProtocolVersion = 1;
     public const string Scheme = "potato-vn";
     public const string Host = "install";
+    /// <summary>单文件大小上限：size 来自深链（任意网页可构造），用于预分配前的合理性检查。</summary>
+    public const ulong MaxSize = 512UL << 30;
 
     private static readonly string[] SupportedArchiveFormats =
         ["7z", "zip", "rar", "tar", "tar.gz", "tar.bz2", "tar.xz", "tar.zst"];
 
     private static readonly Regex ProviderRegex = new("^[a-z0-9._-]{1,64}$", RegexOptions.Compiled);
     private static readonly Regex ChecksumRegex = new("^[0-9a-f]{64}$", RegexOptions.Compiled);
+
+    private const string InvalidFileNameChars = "<>:\"/\\|?*";
+    private static readonly string[] ReservedFileNames =
+    [
+        "CON", "PRN", "AUX", "NUL",
+        "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8", "COM9",
+        "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
+    ];
+    /// <summary>写日志时必须脱敏的参数：带签名的下载直链、压缩包密码。</summary>
+    private static readonly string[] SensitiveQueryKeys = ["url", "archive_password"];
 
     public uint V { get; init; }
     public string Provider { get; init; } = string.Empty;
@@ -96,7 +109,7 @@ public class InstallRequest
             throw new InstallRequestException("archive_password 过长");
         if (ArchivePassword is not null && ArchivePassword.IndexOfAny(['\r', '\n', '\0']) >= 0)
             throw new InstallRequestException("archive_password 包含非法字符");
-        if (Size == 0)
+        if (Size == 0 || Size > MaxSize)
             throw new InstallRequestException("文件大小无效");
 
         switch (ChecksumAlgo, Checksum)
@@ -115,49 +128,82 @@ public class InstallRequest
             throw new InstallRequestException("expires_at 无效");
         if (string.IsNullOrWhiteSpace(BgmId))
             throw new InstallRequestException("bgm_id 不能为空");
-        if (string.IsNullOrWhiteSpace(Title))
-            throw new InstallRequestException("title 不能为空");
+        if (string.IsNullOrWhiteSpace(Title) || Title.Length > 512)
+            throw new InstallRequestException("title 为空或过长");
     }
 
     /// <summary>下载直链是否已过期。</summary>
     public bool IsExpired(DateTimeOffset now) => ExpiresAt is { } expires && now.ToUnixTimeSeconds() >= expires;
 
-    private static bool IsSafeFileName(string value)
+    /// <summary>深链的日志形式：签名直链与压缩包密码替换为占位符，其余参数保留便于排查。</summary>
+    public static string RedactForLog(Uri uri)
     {
-        if (string.IsNullOrWhiteSpace(value) || value is "." or "..") return false;
-        if (value.IndexOfAny(['/', '\\', ':']) >= 0) return false;
-        var fileName = Path.GetFileName(value);
-        return string.Equals(fileName, value, StringComparison.Ordinal);
+        var query = System.Web.HttpUtility.ParseQueryString(uri.Query);
+        var parts = query.AllKeys
+            .Where(key => key is not null)
+            .Select(key => SensitiveQueryKeys.Contains(key!, StringComparer.OrdinalIgnoreCase)
+                ? $"{key}=<redacted>"
+                : $"{key}={query[key]}");
+        return $"{uri.Scheme}://{uri.Host}?{string.Join("&", parts)}";
     }
 
     /// <summary>
-    /// 判断主机是否指向本机/内网（对齐 LunaBox 协议的安全策略，防止 SSRF）。
-    /// 拒绝：localhost、回环、私有网段、链路本地、0.0.0.0、常见内网域名后缀。
+    /// 安全的单段文件/目录名：不含路径分隔符与 Windows 非法字符、不是保留设备名（CON、NUL…）、
+    /// 不以点或空格结尾。用于 file_name 与压缩包顶层目录名（两者都来自不可信输入）。
     /// </summary>
-    private static bool IsPrivateOrLoopbackHost(string host)
+    internal static bool IsSafeFileName(string? value)
     {
-        var normalized = host.Trim().TrimEnd('.').ToLowerInvariant();
-        if (normalized is "localhost" or "0.0.0.0" or "::1") return true;
+        if (string.IsNullOrWhiteSpace(value) || value.Length > 255) return false;
+        if (value is "." or "..") return false;
+        if (value[^1] is '.' or ' ') return false;
+        foreach (var c in value)
+            if (c < 0x20 || InvalidFileNameChars.Contains(c)) return false;
+        var stem = value.Split('.')[0];
+        return !ReservedFileNames.Contains(stem, StringComparer.OrdinalIgnoreCase);
+    }
+
+    /// <summary>
+    /// 判断主机名是否指向本机/内网（对齐 LunaBox 协议的安全策略，防止 SSRF）。
+    /// 这里只能检查字面 IP 与内网域名后缀；域名解析结果与 HTTP 重定向目标由
+    /// DownloadService 在建连时用 <see cref="IsForbiddenAddress"/> 再检查一次。
+    /// </summary>
+    internal static bool IsPrivateOrLoopbackHost(string host)
+    {
+        var normalized = host.Trim().Trim('[', ']').TrimEnd('.').ToLowerInvariant();
+        if (normalized is "localhost") return true;
         if (normalized.EndsWith(".local", StringComparison.Ordinal) ||
             normalized.EndsWith(".internal", StringComparison.Ordinal) ||
             normalized.EndsWith(".lan", StringComparison.Ordinal) ||
-            normalized.EndsWith(".home", StringComparison.Ordinal))
+            normalized.EndsWith(".home", StringComparison.Ordinal) ||
+            normalized.EndsWith(".localhost", StringComparison.Ordinal))
             return true;
+        return IPAddress.TryParse(normalized, out var ip) && IsForbiddenAddress(ip);
+    }
 
-        if (IPAddress.TryParse(normalized, out var ip))
+    /// <summary>
+    /// 禁止连接的地址：回环、未指定、私有网段、CGNAT、链路本地、组播与保留段；
+    /// IPv4 映射的 IPv6 地址按其 IPv4 判断，IPv6 另含唯一本地地址 fc00::/7。
+    /// </summary>
+    internal static bool IsForbiddenAddress(IPAddress ip)
+    {
+        if (ip.IsIPv4MappedToIPv6) ip = ip.MapToIPv4();
+        if (IPAddress.IsLoopback(ip) || ip.Equals(IPAddress.Any) || ip.Equals(IPAddress.IPv6Any)) return true;
+        if (ip.AddressFamily == AddressFamily.InterNetworkV6)
         {
-            if (IPAddress.IsLoopback(ip)) return true;
-            if (ip.AddressFamily == System.Net.Sockets.AddressFamily.InterNetwork)
-            {
-                var bytes = ip.GetAddressBytes();
-                // 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 169.254.0.0/16
-                if (bytes[0] == 10) return true;
-                if (bytes[0] == 172 && bytes[1] is >= 16 and <= 31) return true;
-                if (bytes[0] == 192 && bytes[1] == 168) return true;
-                if (bytes[0] == 169 && bytes[1] == 254) return true;
-            }
+            if (ip.IsIPv6LinkLocal || ip.IsIPv6SiteLocal || ip.IsIPv6Multicast) return true;
+            return (ip.GetAddressBytes()[0] & 0xfe) == 0xfc;
         }
-        return false;
+        var bytes = ip.GetAddressBytes();
+        return bytes[0] switch
+        {
+            0 or 10 or 127 => true,
+            100 when bytes[1] is >= 64 and <= 127 => true,
+            169 when bytes[1] == 254 => true,
+            172 when bytes[1] is >= 16 and <= 31 => true,
+            192 when bytes[1] == 168 => true,
+            >= 224 => true,
+            _ => false,
+        };
     }
 
     private static uint ParseUInt(string? value, string name)

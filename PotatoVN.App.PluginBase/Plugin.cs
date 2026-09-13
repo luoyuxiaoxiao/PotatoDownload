@@ -68,7 +68,20 @@ namespace PotatoVN.App.PluginBase
         public async Task OnUninstallAsync(bool deleteData, Action<TimeSpan> extendWaitHandler, CancellationToken cts)
         {
             if (cts.IsCancellationRequested) return;
+            DownloadManager?.Shutdown(); // 先停下载：后台任务持有程序集与文件句柄，不停会导致 DLL 删除失败
             if (_pushService is not null) await _pushService.StopAsync();
+        }
+
+        /// <summary>启动一次下载流程；流程内部已捕获业务异常，这里只兜底记录意外错误。</summary>
+        private void StartDownload(InstallRequest request)
+        {
+            _hostApi.Info(Microsoft.UI.Xaml.Controls.InfoBarSeverity.Informational,
+                "PotatoDownload", $"开始下载: {request.Title}");
+            _ = DownloadManager.EnqueueAsync(request).ContinueWith(t =>
+                    _hostApi.Log(Microsoft.UI.Xaml.Controls.InfoBarSeverity.Warning,
+                        $"PotatoDownload: enqueue failed: {t.Exception?.GetBaseException().Message}"),
+                TaskContinuationOptions.OnlyOnFaulted);
+            ShowDownloadDialog(); // Chrome 风格：新下载开始时直接呈现下载面板
         }
 
         private void SaveData()
@@ -107,10 +120,7 @@ namespace PotatoVN.App.PluginBase
                 EnqueueConfirmation(request);
                 return Task.CompletedTask;
             }
-            _hostApi.Info(Microsoft.UI.Xaml.Controls.InfoBarSeverity.Informational,
-                "PotatoDownload", $"开始下载: {request.Title}");
-            _ = DownloadManager.EnqueueAsync(request);
-            ShowDownloadDialog(); // Chrome 风格：新下载开始时直接呈现下载面板
+            StartDownload(request);
             return Task.CompletedTask;
         }
 
@@ -152,10 +162,7 @@ namespace PotatoVN.App.PluginBase
                     var result = await dialog.ShowAsync();
                     if (result == Microsoft.UI.Xaml.Controls.ContentDialogResult.Primary)
                     {
-                        _hostApi.Info(Microsoft.UI.Xaml.Controls.InfoBarSeverity.Informational,
-                            "PotatoDownload", $"开始下载: {captured.Title}");
-                        _ = DownloadManager.EnqueueAsync(captured);
-                        ShowDownloadDialog();
+                        StartDownload(captured);
                     }
                     else
                     {

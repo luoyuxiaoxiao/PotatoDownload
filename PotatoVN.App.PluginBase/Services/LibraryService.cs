@@ -73,13 +73,14 @@ public class LibraryService
     /// <summary>在库中按外部 ID 查找同一游戏（任一 ID 命中即视为同一游戏）。</summary>
     private Galgame? FindExisting(InstallRequest request)
     {
+        var vndbId = NormalizeVndbId(request.VndbId);
         foreach (var game in _hostApi.GetAllGames())
         {
             if (!string.IsNullOrEmpty(request.BgmId) &&
                 game.Ids[(int)RssType.Bangumi] == request.BgmId)
                 return game;
-            if (!string.IsNullOrEmpty(request.VndbId) &&
-                game.Ids[(int)RssType.Vndb] == request.VndbId)
+            if (!string.IsNullOrEmpty(vndbId) &&
+                NormalizeVndbId(game.Ids[(int)RssType.Vndb]) == vndbId)
                 return game;
             if (!string.IsNullOrEmpty(request.HikarinagiId) &&
                 game.Ids[(int)RssType.Hikarinagi] == request.HikarinagiId)
@@ -87,4 +88,8 @@ public class LibraryService
         }
         return null;
     }
+
+    /// <summary>VNDB ID 在 Shionlib 侧带 v 前缀（v17），宿主库里可能不带（17），比较前统一去掉。</summary>
+    private static string? NormalizeVndbId(string? id) =>
+        id is { Length: > 1 } && (id[0] is 'v' or 'V') ? id[1..] : id;
 }

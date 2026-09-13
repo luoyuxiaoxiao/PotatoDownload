@@ -32,7 +32,6 @@ public class PushService
     private readonly IPotatoVnApi _hostApi;
     private readonly Func<Exception?, string?, Task>? _reportError;
     private readonly ConcurrentDictionary<string, DateTime> _seenUris = new();
-    private readonly ConcurrentDictionary<string, byte> _seenKeys = new();
     private CancellationTokenSource? _cts;
     private Task? _pollTask;
     private bool _eventSubscribed;
@@ -120,7 +119,7 @@ public class PushService
             var uri = ExtractUri(args);
             if (uri is null) return;
             _hostApi.Log(InfoBarSeverity.Warning,
-                $"PotatoDownload: activation event captured: {uri}");
+                $"PotatoDownload: activation event captured: {InstallRequest.RedactForLog(uri)}");
             HandleUri(uri, "event");
         }
         catch (Exception e)
@@ -225,28 +224,27 @@ public class PushService
 
             // 注意：Log 的 Informational 级别会被宿主的开发者模式开关过滤；
             // 与 potato-vn 推送直接相关的观测一律用 Warning（始终写入 log.txt）。
+            // 日志里不落签名直链与压缩包密码。
+            var redacted = InstallRequest.RedactForLog(uri);
             _hostApi.Log(InfoBarSeverity.Warning,
-                $"PotatoDownload: potato-vn activation via {source}: {uri}");
+                $"PotatoDownload: potato-vn activation via {source}: {redacted}");
 
             var uriString = uri.ToString();
             var now = DateTime.UtcNow;
 
-            // 时间窗口去重：30 秒内同一 URI 只处理一次；窗口过后可再次触发（便于重复测试）
+            // 时间窗口去重：事件通道与轮询通道可能重复送达同一次激活；
+            // 同一资源的重复推送由 DownloadManager 按活动任务去重，任务结束后允许再推重试。
             if (_seenUris.TryGetValue(uriString, out var lastSeen) && now - lastSeen < DedupeWindow)
             {
                 _hostApi.Log(InfoBarSeverity.Informational,
-                    $"PotatoDownload: duplicate push ignored within window ({uriString[..Math.Min(80, uriString.Length)]}...)");
+                    $"PotatoDownload: duplicate activation ignored within window ({redacted})");
                 return;
             }
             _seenUris[uriString] = now;
+            foreach (var stale in _seenUris)
+                if (now - stale.Value >= DedupeWindow) _seenUris.TryRemove(stale.Key, out _);
 
             var request = InstallRequest.Parse(uri);
-            if (!_seenKeys.TryAdd(request.DeduplicationKey, 0))
-            {
-                _hostApi.Log(InfoBarSeverity.Informational,
-                    $"PotatoDownload: duplicate push ignored ({request.Title})");
-                return;
-            }
             _hostApi.Log(InfoBarSeverity.Warning,
                 $"PotatoDownload: push received ({request.Title})");
             _ = Task.Run(() => RequestReceived?.Invoke(request));

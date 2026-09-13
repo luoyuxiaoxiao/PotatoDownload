@@ -61,7 +61,7 @@
 - **插件只能调用宿主稳定版（v1.10.2）已有的插件 API**（2026-09 用户实测 MissingMethodException）：dev 版新增的 GetGameByUid/GetGameById/AddVirtualGameAsync(Galgame)/AddSourceAsync/AddGameToSource/SaveGameAsync/InvokeOnMainThreadAsync 一律不能用；精确刮削流程：GetAllGames 按 Ids 手动查重 → AddVirtualGame(name) 建占位后补设 `game.Ids[(int)RssType.*]`（宿主同对象引用，立即生效）→ AddGameInstallation(path)；模型/枚举（Galgame.Ids、RssType 含 Hikarinagi、NameOnlyGameMatchException、GalgameUid）两版一致可用；Plugin.ReportHostApiSurface 启动时上报宿主 API 面（发布前随 DevReportInfo 一并移除）
 - **宿主 AddVirtualGame(name) 会按名字联网刮削，查无此游戏直接抛 PvnException**（requireConfirm:false 也一样）→ EnsurePlaceholderAsync 必须容错返回 null 继续主流程；E2E 测试 title 必须是真实可刮游戏（用 CLANNAD=bgm 13），bgm 237 是动漫《攻壳机动队》不是游戏；api.bgm.tv 在本机构建环境被墙，bgm.tv 网页版可达
 - 参考实现：ReinaManager `src-tauri/src/install/`（protocol/download/workflow），Shionlib `apps/frontend/components/game/download/helpers/reina.ts`
-- 下载架构：DownloadService 多线程分块（4 连接 × 4MB 块，Range 探测失败退化为单连接续传），.part + .part.watermark 断点续传；DownloadManager 串行队列 + ObservableCollection<DownloadTask> 供 UI 绑定
+- 下载架构：DownloadService 多线程分块（4 连接 × 4MB 块，`File.OpenHandle`+`RandomAccess` 定位写，Range 探测失败退化为单连接续传），.part + .part.watermark 断点续传（水位=从头连续已落盘字节）；压缩包与 .part 放在下载目录下 `.potatodownload\` 暂存子目录（不碰用户同名文件）；哈希校验在 DownloadManager 做，失败即删文件；DownloadManager 串行队列 + ObservableCollection<DownloadTask>（增删遍历只在主线程）供 UI 绑定；去重只对活动任务，失败后可再推重试
 - UI：侧边栏按钮"下载"→ ContentDialog 弹窗（DownloadProgressDialog，纯C#，Chrome 风格：进行中+历史记录两区，速度 EMA 平滑 + 500ms 限流），无独立页面；设置页 UserControl1（纯C#）；主题资源查找走 Helper/PluginTheme
 - 交互语义：自动下载 ON=立即下载并自动弹下载面板；OFF=弹"确认下载"ContentDialog；**全部弹窗（确认/下载面板/测试面板）经 Plugin_Ui 的 EnqueueDialog 串行协调器**——ContentDialog 同时只能开一个，各自 ShowAsync 会撞车静默吞请求（2026-09 远程报错实证）；推送到达自动弹面板是**宿主 DefaultActivationHandler 导航不可抑制**的替代方案（插件 API 无法阻止跳起始页）
 - 断点续传坑：.part+水位在失败中断后会残留；DownloadAsync 开头对"水位与文件大小都达预期"的 .part 直接复用跳过下载；DownloadSequentialAsync 里 committed>0 但响应不是 206（服务端忽略 Range 整包返回）必须清零从头覆盖，否则重复追加成 2 倍大小（2026-09 实测 363→726）
@@ -77,6 +77,11 @@
 - 模板 csproj 无 ImplicitUsings，新 .cs 文件需手写 using System/IO/Linq/Net.Http 等
 - 带 BOM 的 .cs 文件 file_editor 会误判为二进制，用 PowerShell ReadAllText 确认内容
 - BLAKE3 用 Blake3.Managed NuGet（纯托管）；SharpCompress 用 0.50.4（0.38 有漏洞 NU1902）
+- **SharpCompress 0.50.4 用法坑（2026-09-13 自检实证）**：`ExtractAllEntries()` 只能用于 solid 或 7z，其它格式抛异常；`ArchiveFactory` 打不开 tar.gz/bz2/xz/zst，tar 系列必须按 archive_format 用 `options.Providers.CreateDecompressStream` 自己剥外层再交 `ReaderFactory.OpenReader`（让它直接探测压缩 tar 会因 bz2 首块 ~900KB 撞回卷缓冲上限）；GZip 解压流没读到尾就 Dispose 会抛 CRC 异常，清理时吞掉；zip-slip/符号链接越界由库自带目标目录检查拒绝（已验证）
+- **多线程共享一个 FileStream Seek+Write 会串位**（旧分块下载的隐藏 bug，只在 >4MB 且服务端支持 Range 时触发）；水位必须是连续前缀，块乱序完成时只推进连续部分，否则续传漏块
+- 核心逻辑自检工程 `Tests/CoreChecks`（net8.0 控制台，链接编译 InstallRequest/DownloadService/UnpackService，本地 HttpListener 模拟各种异常服务端；100 项）：`cd Tests/CoreChecks && dotnet run`，`CORECHECKS_ONLINE=1` 额外跑真实 HTTPS；Linux 上须 `NUGET_PACKAGES=~/.nuget/packages` 覆盖根 NuGet.Config 里的 Windows 路径；本机 .NET 8 SDK 装在 ~/.dotnet（`DOTNET_ROOT=~/.dotnet`）；WinUI 相关文件（Plugin*.cs/Controls/PushService）只能在 Windows 构建机编译
+- **仓库 .cs 源文件是 CRLF + BOM**：整文件重写后要把行尾/BOM 归一化回去，否则 diff 全文件变红
+- 安全审查结论（2026-09-13，已修）：压缩包顶层目录名 `..`/同名目录导致 `Directory.Delete` 误删（现只删带 `.potatodownload-incomplete` 标记的自建目录，其它改用"名称 (2)"）；日志落签名直链与 archive_password（现 RedactForLog 脱敏）；服务端多发数据无上限/分块回 200 越界写/无空闲超时永久卡队列；SSRF 只查字面主机（现 SocketsHttpHandler.ConnectCallback 按解析 IP 拒绝内网含重定向，IPv6 ULA/映射地址覆盖）；size 无上限直接预分配（现 MaxSize 512GiB + 磁盘可用空间检查）；file_name 未拒 Windows 非法字符/保留名；永久去重键阻断失败重试；历史保存与主线程插入竞态；占位游戏在下载前创建留下空条目；卸载不取消下载锁 DLL。AutoDownload 默认值已改为关（2026-09-13，任意网页触发深链不再静默下载+解压+入库；首次推送先弹确认框）
 - **激活参数的 COM 代理在激活回调结束后立即失效**（2026-09 远程诊断实证：轮询读 Kind 即抛 0x800706BA 类错误；GetActivatedEventArgs 确实反映热激活，但对象已死）→ **热激活必须订阅 AppInstance.Activated** 并在回调里同步取出 URI 值（只带托管值出来，绝不存 args 引用）；冷启动不触发该事件，由轮询 GetActivatedEventArgs 兜底（初始参数长期有效；同一引用只读一次，失效属预期静默跳过）。宿主 DefaultActivationHandler 对任何激活都导航起始页——用户看到跳转 ≠ 插件收到激活
 - **静态事件订阅的安全做法**（旧规则"绝不订阅"源于未做清理时的 DLL 锁定 UnauthorizedAccessException）：StopAsync 必须 退订 + GC.Collect×2/WaitForPendingFinalizers 释放 WinRT CCW + await 后台 Task 停止 + 清空事件委托；验证方式：插件热更新/卸载一次看是否再报文件占用
 - **宿主 InfoService.Log 的 Informational/Success 级别和 DeveloperEvent 都会被 DevelopmentMode 开关过滤**：给普通用户排查必须用 Warning/Error 级别（始终落 Logs\log.txt）+ DevReportInfo 远程上报（PushService.ReportThrottled 限流）
@@ -90,7 +95,10 @@
 - 本插件远程仓库：github.com/luoyuxiaoxiao/PotatoDownload（main 与 plan 均已推送；用户明确要求 push 到 main）
 - **分支分工（用户约定）：plan=开发线（保留推送测试功能），main=发布线（无测试功能，DevReportInfo 空实现）**；v0.1.0 已发布到应用市场（tag v0.1.0，包页 plugin.api.potatovn.net/pvn-plugin/package/dfb57882-7b2f-4db3-8fe8-5f3517d1f4c8/0.1.0）
 - publish_plugin 流程：build_plugin → upload_test_build 拿 artifact_id → publish_plugin(artifact_id, version, changelog, plugin_info)；**首次发布必须先随调用提交 plugin_info**（name/description/author/homepage），否则 400 "Plugin info must be submitted before publishing"
-- 后续计划：推送测试拆成独立插件（新插件 ID/工作区）；Shionlib 上游支持（其前端加 PotatoVN 按钮，scheme 换 potato-vn:// 参数兼容）
+- 后续计划：推送测试拆成独立插件（新插件 ID/工作区）
+- **Shionlib 上游支持 PR（2026-09-13 已在 fork 上完成）**：本地克隆 ~/Projects/scratch/shionlib（origin=fork SSH，upstream=Ringyuki），分支 feat/potatovn-download 已推到 fork；改法完全镜像上游 #13 ReinaManager（helpers/potatovn.ts + ways/PotatoVN.tsx + settings/PotatoVN.tsx + store showPotatoVN + zh/en/ja 文案 + guides/potatovn-download.mdx），PR 描述草稿在 ~/Projects/scratch/shionlib-pr-body.md；**用户要求：不要改动上游已有文件如 reina.ts（别人的源码），只做新增+接线**；已开 PR #18 到上游 `dev` 分支（仓库 CI 只对 main 触发，PR 上无自动检查，靠本地 format/lint/i18n/tsc/test:cov 全过）；frontmatter 作者信息已补（uid 8395、头像 t.shionlib.com/user/8395/avatar/59405d19-…webp），banner 复用 potatovn-sync 的图；feat/partner-download-api 是后端机器鉴权 API，与深链推送无关，不必模仿
+- 应用市场包页当前不可访问（发布待审核）——文档里只写"插件市场搜索 PotatoDownload"+GitHub 仓库链接，不放包页 URL
+- Shionlib 仓库检查：husky pre-commit 跑 lint-staged，pre-push 跑全仓 typecheck + 前端/后端/og 单测（后端 jest 很慢，push 需数分钟）；CI 前端门槛 = prettier/eslint/i18n:check/tsc/test:cov（覆盖率阈值 statements 70）
 - 默认下载目录：系统盘 Galgame 文件夹（Plugin.DefaultDownloadPath，Path.GetPathRoot(Environment.SystemDirectory)，一定存在；留空设置项时的回退）
 
 <!-- MEMORY END -->

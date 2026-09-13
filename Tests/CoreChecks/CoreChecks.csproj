@@ -1,0 +1,21 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <!-- 核心逻辑自检工程（不依赖 WinUI 宿主，Linux/Windows 均可）：cd Tests/CoreChecks && dotnet run -->
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net8.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>disable</ImplicitUsings>
+    <LangVersion>12</LangVersion>
+    <RootNamespace>CoreChecks</RootNamespace>
+    <NoWarn>CS1591</NoWarn>
+  </PropertyGroup>
+  <ItemGroup>
+    <Compile Include="../../PotatoVN.App.PluginBase/Models/InstallRequest.cs" Link="Plugin/InstallRequest.cs" />
+    <Compile Include="../../PotatoVN.App.PluginBase/Services/DownloadService.cs" Link="Plugin/DownloadService.cs" />
+    <Compile Include="../../PotatoVN.App.PluginBase/Services/UnpackService.cs" Link="Plugin/UnpackService.cs" />
+  </ItemGroup>
+  <ItemGroup>
+    <PackageReference Include="Blake3.Managed" Version="1.5.2" />
+    <PackageReference Include="SharpCompress" Version="0.50.4" />
+  </ItemGroup>
+</Project>

@@ -16,7 +16,7 @@ public partial class PluginData : ObservableRecipient
     [ObservableProperty] private string _downloadPath = string.Empty;
 
     /// <summary>收到推送后是否自动开始下载；关闭时弹出确认框，用户点击「下载」后才开始</summary>
-    [ObservableProperty] private bool _autoDownload = true;
+    [ObservableProperty] private bool _autoDownload = false;
 
     /// <summary>下载历史（最新在前，最多保留 50 条）</summary>
     public ObservableCollection<DownloadRecord> History { get; } = [];
