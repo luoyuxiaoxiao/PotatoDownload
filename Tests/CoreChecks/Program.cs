@@ -10,6 +10,7 @@ using System.Net.Sockets;
 using System.Security.Cryptography;
 using System.Threading;
 using System.Threading.Tasks;
+using PotatoVN.App.PluginBase;
 using PotatoVN.App.PluginBase.Models;
 using PotatoVN.App.PluginBase.Services;
 
@@ -33,6 +34,7 @@ internal static class Program
             CheckValidation();
             await CheckDownloadsAsync();
             await CheckUnpackAsync();
+            await CheckManagerAsync();
         }
         finally
         {
@@ -131,7 +133,8 @@ internal static class Program
         var dir = Path.Combine(Root, "dl");
         Directory.CreateDirectory(dir);
 
-        DownloadService NewService() => new(new SocketsHttpHandler(), idle);
+        // 4MB 块：25MB 载荷 = 7 块，与下面各场景的偏移假设一致；重试退避上限压到 3 次（1s+2s）让失败用例跑得快
+        DownloadService NewService() => new(new SocketsHttpHandler(), idle, 4 * 1024 * 1024) { MaxAttempts = 3 };
         InstallRequest R(string mode, string? algo = "sha256", string? checksum = null) => new()
         {
             V = 1, Provider = "shionlib", ResourceId = "1", Url = server.Prefix + mode, FileName = "g.bin", ArchiveFormat = "zip",
@@ -143,7 +146,7 @@ internal static class Program
         // 1. 分块并发下载
         var t1 = Target("ok.bin");
         await NewService().DownloadAsync(R("ok"), t1);
-        Check(FileSha(t1) == sha, "download: chunked (7 chunks, 4 connections) matches sha256");
+        Check(FileSha(t1) == sha, "download: chunked (7 chunks, up to 6 connections) matches sha256");
         Check(!File.Exists(t1 + ".part") && !File.Exists(t1 + ".part.watermark"), "download: .part and watermark cleaned up");
         Check(await Throws(() => DownloadService.VerifyChecksumAsync(R("ok"), t1)) is null, "verify: sha256 accepted");
         Check(await Throws(() => DownloadService.VerifyChecksumAsync(R("ok", checksum: new string('0', 64)), t1)) is DownloadException, "verify: wrong sha256 rejected");
@@ -191,7 +194,7 @@ internal static class Program
         var e7 = await Throws(() => NewService().DownloadAsync(R("wronglen"), Target("wronglen.bin")));
         Check(e7 is DownloadException && e7.Message.Contains("与声明不符"), $"download: rejects Content-Length mismatch up front ({e7?.Message})");
 
-        // 8. 服务器发完头就不动 → 空闲超时
+        // 8. 服务器发完头就不动 → 空闲超时（3 次尝试 × 2s 空闲 + 1s/2s 退避 ≈ 9s 内）
         var watch = Stopwatch.StartNew();
         var e8 = await Throws(() => NewService().DownloadAsync(R("stall"), Target("stall.bin")));
         Check(e8 is DownloadException && e8.Message.Contains("空闲超时") && watch.Elapsed < TimeSpan.FromSeconds(15),
@@ -200,6 +203,31 @@ internal static class Program
         // 9. 探测回 206 但分块请求回 200
         var e9 = await Throws(() => NewService().DownloadAsync(R("rangebroken"), Target("rb.bin")));
         Check(e9 is DownloadException && e9.Message.Contains("未按 Range"), $"download: chunk request answered with 200 is rejected ({e9?.Message})");
+
+        // 9b. 限流（429）与 5xx 是瞬时错误：退避重试后成功，内容完整（Shionlib 代理超并发即回 429 + Retry-After: 1）
+        server.ResetCounters();
+        var t9b = Target("flaky.bin");
+        watch.Restart();
+        var e9b = await Throws(() => NewService().DownloadAsync(R("flaky"), t9b));
+        Check(e9b is null && FileSha(t9b) == sha, $"download: 429/503 on first attempts are retried and the file is complete ({e9b?.Message})");
+        Check(server.FlakyRejections >= 2, $"download: server really rejected {server.FlakyRejections} requests before succeeding");
+
+        // 9c. 一块彻底失败（403）→ 其余连接立即中止，根因浮现，而不是等所有块慢慢跑完。
+        //     用 1MB 块（26 块 > 8 连接）：不中止的话 8 连接要跑 4 轮慢块（≈4s、25 个慢请求）
+        server.ResetCounters();
+        watch.Restart();
+        var small = new DownloadService(new SocketsHttpHandler(), idle, 1024 * 1024) { MaxAttempts = 3 };
+        var e9c = await Throws(() => small.DownloadAsync(R("chunk3forbidden"), Target("forbidden.bin")));
+        Check(e9c is DownloadException && e9c.Message.Contains("403") && watch.Elapsed < TimeSpan.FromSeconds(3),
+            $"download: a chunk rejected with 403 fails the whole download fast with the real reason in {watch.Elapsed.TotalSeconds:F1}s ({e9c?.GetType().Name}: {e9c?.Message})");
+        Check(server.SlowChunkRequests <= 8, $"download: sibling connections were aborted ({server.SlowChunkRequests} slow-chunk requests served, 25 without abort)");
+
+        // 9d. 探测时被限流不能静默退化成单连接：重试后仍走分块
+        server.ResetCounters();
+        var t9d = Target("probe429.bin");
+        var e9d = await Throws(() => NewService().DownloadAsync(R("probe429"), t9d));
+        Check(e9d is null && FileSha(t9d) == sha && server.RangeRequests > 2,
+            $"download: probe hit by 429 retries instead of falling back to sequential ({server.RangeRequests} range requests, {e9d?.Message})");
 
         // 10. 默认传输层在建连时拒绝回环/内网地址（本测试服务器就在 127.0.0.1）
         var e10 = await Throws(() => new DownloadService().DownloadAsync(R("ok"), Target("ssrf.bin")));
@@ -407,6 +435,107 @@ internal static class Program
         }
     }
 
+    // ---------------------------------------------------------------- DownloadManager（宿主 API 见 HostStubs）
+
+    private static async Task<T> WaitUntilAsync<T>(Func<T?> probe, string what, int timeoutMs = 30000) where T : class
+    {
+        var watch = Stopwatch.StartNew();
+        while (watch.ElapsedMilliseconds < timeoutMs)
+        {
+            if (probe() is { } value) return value;
+            await Task.Delay(20);
+        }
+        throw new TimeoutException($"timed out waiting for {what}");
+    }
+
+    private static async Task CheckManagerAsync()
+    {
+        // 载荷是真正的 zip（20MB 不压缩条目），管线要走完 下载→校验→解压→入库(桩)→完成
+        var dir = Path.Combine(Root, "mgr");
+        Directory.CreateDirectory(dir);
+        var zipPath = Path.Combine(dir, "payload.zip");
+        var content = new byte[20 * 1024 * 1024];
+        new Random(9).NextBytes(content);
+        using (var zip = ZipFile.Open(zipPath, ZipArchiveMode.Create))
+        {
+            using (var data = zip.CreateEntry("Game/data.bin", CompressionLevel.NoCompression).Open()) data.Write(content);
+            using (var exe = zip.CreateEntry("Game/game.exe", CompressionLevel.NoCompression).Open()) exe.Write("exe"u8);
+        }
+        var payload = File.ReadAllBytes(zipPath);
+        File.Delete(zipPath);
+        var sha = Convert.ToHexString(SHA256.HashData(payload)).ToLowerInvariant();
+        using var server = new TestServer(payload);
+        var downloadDir = Path.Combine(dir, "downloads");
+        Plugin.DownloadPath = downloadDir;
+        var host = new HostStub();
+        var manager = new DownloadManager(host)
+        {
+            ServiceFactory = () => new DownloadService(new SocketsHttpHandler(), TimeSpan.FromSeconds(5), 4 * 1024 * 1024),
+        };
+        InstallRequest R(string mode) => new()
+        {
+            V = 1, Provider = "shionlib", ResourceId = mode, Url = server.Prefix + mode, FileName = "g.zip", ArchiveFormat = "zip",
+            Size = (ulong)payload.Length, BgmId = "13", Title = "CLANNAD " + mode, ChecksumAlgo = "sha256", Checksum = sha,
+        };
+        var pack = Path.Combine(downloadDir, ".potatodownload", "g.zip");
+        bool PartExists() => File.Exists(pack + ".part");
+        Task<DownloadTask> Downloading(int index) => WaitUntilAsync(
+            () => manager.Tasks.Count > index && manager.Tasks[index] is { Stage: DownloadTaskStage.Downloading, Received: > 0 } t ? t : null,
+            $"task {index} to start receiving");
+
+        // 1. 完整流程
+        await manager.EnqueueAsync(R("ok"));
+        var t1 = manager.Tasks[0];
+        Check(t1.Stage == DownloadTaskStage.Completed && t1.Received == t1.Total && host.Errors == 0,
+            $"manager: full pipeline completes ({t1.Stage}: {t1.Message})");
+        // 游戏目录名取自压缩包唯一顶层文件夹（Game），包内结构原样解到该目录下：downloads/Game/Game/game.exe
+        Check(File.Exists(Path.Combine(downloadDir, "Game", "Game", "game.exe"))
+              && !File.Exists(Path.Combine(downloadDir, "Game", UnpackService.IncompleteMarker)), "manager: game extracted and marked complete");
+        Check(!File.Exists(pack) && !PartExists(), "manager: staging archive removed after import");
+        Check(Plugin.HistoryCollection.Count == 1 && Plugin.HistoryCollection[0].Outcome == DownloadRecord.OutcomeCompleted,
+            "manager: history records the completion");
+
+        // 2. 下载中取消 → 任务 Cancelled，.part/水位/暂存包全部删除，记历史
+        var run2 = manager.EnqueueAsync(R("slow"));
+        var t2 = await Downloading(1);
+        manager.CancelTask(t2);
+        await run2;
+        Check(t2.Stage == DownloadTaskStage.Cancelled && !t2.IsListed, $"manager: cancel mid-download ends as Cancelled ({t2.Stage})");
+        Check(!PartExists() && !File.Exists(pack + ".part.watermark") && !File.Exists(pack),
+            "manager: cancel deletes .part, watermark and staging archive");
+        Check(Plugin.HistoryCollection[0].Outcome == DownloadRecord.OutcomeCancelled, "manager: history records the cancellation");
+
+        // 3. 下载中暂停 → 保留 .part、仍参与去重；继续 → 完成
+        var run3 = manager.EnqueueAsync(R("slow"));
+        var t3 = await Downloading(2);
+        t3.Pause();
+        await run3;
+        Check(t3.Stage == DownloadTaskStage.Paused && PartExists(), $"manager: pause keeps the .part ({t3.Stage}, part exists: {PartExists()})");
+        Check(manager.HasActiveTask(t3.Request.DeduplicationKey), "manager: a paused task still blocks a duplicate push");
+        manager.ResumeTask(t3);
+        await WaitUntilAsync(() => t3.IsListed ? null : t3, "resumed task to finish", 90000);
+        Check(t3.Stage == DownloadTaskStage.Completed && File.Exists(Path.Combine(downloadDir, "Game (2)", "Game", "game.exe")),
+            $"manager: resume finishes the paused task into 'Game (2)' ({t3.Stage}: {t3.Message})");
+
+        // 4. 暂停后取消 → 清理现场
+        var run4 = manager.EnqueueAsync(R("slow"));
+        var t4 = await Downloading(3);
+        t4.Pause();
+        await run4;
+        manager.CancelTask(t4);
+        Check(t4.Stage == DownloadTaskStage.Cancelled && !PartExists() && !File.Exists(pack + ".part.watermark"),
+            $"manager: cancelling a paused task deletes its .part ({t4.Stage})");
+
+        // 5. 暂停请求后紧接着取消（管线尚未收尾）：最终语义是取消，不是暂停
+        var run5 = manager.EnqueueAsync(R("slow"));
+        var t5 = await Downloading(4);
+        t5.Pause();
+        manager.CancelTask(t5);
+        await run5;
+        Check(t5.Stage == DownloadTaskStage.Cancelled && !PartExists(), $"manager: pause immediately followed by cancel ends as Cancelled ({t5.Stage})");
+        Check(host.Errors == 0, $"manager: no error events were raised during the scenarios ({host.Errors})");
+    }
+
     // ---------------------------------------------------------------- 测试用 HTTP 服务器
 
     /// <summary>本地 HTTP 服务器，按路径模拟正常与异常行为。</summary>
@@ -415,8 +544,15 @@ internal static class Program
         private readonly HttpListener _listener = new();
         private readonly CancellationTokenSource _cts = new();
         private readonly byte[] _payload;
+        private int _flakyHits, _flakyRejections, _slowChunkRequests, _rangeRequests, _probeHits;
 
         public string Prefix { get; }
+        public int FlakyRejections => _flakyRejections;
+        public int SlowChunkRequests => _slowChunkRequests;
+        public int RangeRequests => _rangeRequests;
+
+        public void ResetCounters() =>
+            _flakyHits = _flakyRejections = _slowChunkRequests = _rangeRequests = _probeHits = 0;
 
         public TestServer(byte[] payload)
         {
@@ -468,6 +604,9 @@ internal static class Program
                     case "ok": // 正常：支持 Range
                         await ServeAsync(response, hasRange, start, end, _payload);
                         break;
+                    case "slow": // 支持 Range，每 256KB 停 40ms：给暂停/取消留出下载中的窗口
+                        await ServeAsync(response, hasRange, start, end, _payload, 256 * 1024, 40);
+                        break;
                     case "garbagebelow8m": // 8MiB 以下返回垃圾：证明续传确实跳过了已完成的块
                         await ServeAsync(response, hasRange, start, end, start < 8L << 20 ? new byte[_payload.Length] : _payload);
                         break;
@@ -510,6 +649,41 @@ internal static class Program
                             await response.OutputStream.WriteAsync(_payload);
                         }
                         break;
+                    case "flaky": // 前两个分块请求分别回 429 / 503，之后正常：验证瞬时错误重试
+                    {
+                        var n = hasRange && length > 1 ? Interlocked.Increment(ref _flakyHits) : 0;
+                        if (n is 1 or 2)
+                        {
+                            Interlocked.Increment(ref _flakyRejections);
+                            response.StatusCode = n == 1 ? 429 : 503;
+                            response.AddHeader("Retry-After", "1");
+                            break;
+                        }
+                        await ServeAsync(response, hasRange, start, end, _payload);
+                        break;
+                    }
+                    case "chunk3forbidden": // 第 3 块（1MB 块）永远 403（确定性失败），其余块慢吞吞：验证兄弟连接被立即中止
+                        if (hasRange && start == 3L * 1024 * 1024)
+                        {
+                            response.StatusCode = 403;
+                            break;
+                        }
+                        if (hasRange && length > 1)
+                        {
+                            Interlocked.Increment(ref _slowChunkRequests);
+                            await Task.Delay(1000, _cts.Token);
+                        }
+                        await ServeAsync(response, hasRange, start, end, _payload);
+                        break;
+                    case "probe429": // 第一次探测（1 字节 Range）回 429，之后一切正常
+                        if (hasRange) Interlocked.Increment(ref _rangeRequests);
+                        if (hasRange && length == 1 && Interlocked.Increment(ref _probeHits) == 1)
+                        {
+                            response.StatusCode = 429;
+                            break;
+                        }
+                        await ServeAsync(response, hasRange, start, end, _payload);
+                        break;
                     default:
                         response.StatusCode = 404;
                         break;
@@ -525,15 +699,27 @@ internal static class Program
             }
         }
 
-        private static async Task ServeAsync(HttpListenerResponse response, bool partial, long start, long end, byte[] data)
+        private async Task ServeAsync(HttpListenerResponse response, bool partial, long start, long end, byte[] data,
+            int pieceSize = 0, int pieceDelayMs = 0)
         {
             if (partial)
             {
                 response.StatusCode = 206;
                 response.AddHeader("Content-Range", $"bytes {start}-{end}/{data.Length}");
             }
-            response.ContentLength64 = end - start + 1;
-            await response.OutputStream.WriteAsync(data.AsMemory((int)start, (int)(end - start + 1)));
+            var length = (int)(end - start + 1);
+            response.ContentLength64 = length;
+            if (pieceSize <= 0)
+            {
+                await response.OutputStream.WriteAsync(data.AsMemory((int)start, length));
+                return;
+            }
+            for (var offset = 0; offset < length; offset += pieceSize)
+            {
+                await response.OutputStream.WriteAsync(data.AsMemory((int)start + offset, Math.Min(pieceSize, length - offset)));
+                await response.OutputStream.FlushAsync();
+                await Task.Delay(pieceDelayMs, _cts.Token);
+            }
         }
 
         public void Dispose()
