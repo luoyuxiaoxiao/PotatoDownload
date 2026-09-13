@@ -87,7 +87,10 @@
 - **静态事件订阅的安全做法**（旧规则"绝不订阅"源于未做清理时的 DLL 锁定 UnauthorizedAccessException）：StopAsync 必须 退订 + GC.Collect×2/WaitForPendingFinalizers 释放 WinRT CCW + await 后台 Task 停止 + 清空事件委托；验证方式：插件热更新/卸载一次看是否再报文件占用
 - **宿主 InfoService.Log 的 Informational/Success 级别和 DeveloperEvent 都会被 DevelopmentMode 开关过滤**：给普通用户排查必须用 Warning/Error 级别（始终落 Logs\log.txt）+ DevReportInfo 远程上报（PushService.ReportThrottled 限流）
 - **WinRT `GetActivatedEventArgs()` 每次调用都可能返回新的托管包装对象，`ReferenceEquals` 去重不可靠**（2026-09-13 生产实证：冷启动激活每隔 30s 去重窗口到期就被轮询重复投递，反复弹确认框）→ 冷启动轮询兜底必须「成功读到一次初始参数（或确认代理已失效）即退出」，此后激活一律走事件通道；重复推送的 UX 兜底：确认框弹出前先查活动任务，已在下载就改为亮出下载面板
-- **从 UI 线程回调（ContentDialog 按钮等）启动的整条 async 任务链必须先 `Task.Run` 落到线程池**（2026-09-13 生产实证：确认框回调里直接 EnqueueAsync，await 捕获 DispatcherQueue 同步上下文，整个下载管线的续体被泵进 UI 线程 → 弹窗冻结但下载在跑；AutoDownload 默认关使确认路径成为主路径后才暴露）；下载任务取消：每任务 CTS 与 Shutdown 令牌链接，.part+水位保留可续传，取消写历史为 Cancelled
+- **从 UI 线程回调（ContentDialog 按钮等）启动的整条 async 任务链必须先 `Task.Run` 落到线程池**（2026-09-13 生产实证：确认框回调里直接 EnqueueAsync，await 捕获 DispatcherQueue 同步上下文，整个下载管线的续体被泵进 UI 线程；AutoDownload 默认关使确认路径成为主路径后才暴露）
+- **弹窗进度刷新已改为 DispatcherTimer 轮询（500ms 直接读任务模型），不再依赖 PropertyChanged→InvokeOnMainThread 链路**（2026-09-13 生产实证：线程池落地修复后弹窗仍冻结、只在打开瞬间显示一次快照——事件链路在宿主环境不可靠，精确根因未查明；计时器与弹窗同在 UI 线程，结构性免疫；关闭后内容未必触发 Unloaded，tick 里须自查 IsLoaded 停表防泄漏）
+- **取消语义（用户约定）：用户主动取消 = 放弃文件**，删暂存包/.part/水位 + 带 `.potatodownload-incomplete` 标记的自建目录（无标记绝不动）；插件 Shutdown 才保留续传现场；取消写历史为 Cancelled。注意：取消恰好发生在入库阶段时占位游戏可能残留（宿主稳定版无删游戏 API）
+- **upload_test_build 必须在 build_plugin 成功后立即调用，中间不要插任何命令**（2026-09-13 实证：build 后先跑 git commit，产物 zip 在 artifacts/ 里凭空消失，upload 报 Build artifact not found；重 build 后立即 upload 即成功）
 - **行尾/BOM 按目录分两类**：插件 .cs 是 CRLF **无 BOM**（2026-09-13 对 5 个核心文件 HEAD 实测；更早"CRLF+BOM"的记忆不准确），Tests/CoreChecks 是 LF 无 BOM（Linux 产物，仓库无 .gitattributes）；file_editor 保存会改写行尾，提交前必须 `git diff --stat` 核对并归一化，否则 diff 全文件变红
 - **工作区可能被平台重置**（2026-09-13 实例：工作树被重置为 main 的 Initial commit，源文件全删，但 plan 分支的 git 对象幸存 → git checkout plan 一键全恢复；obj/Stamped 也可作最后退路）。教训：关键节点勤 push 到远程，不要只依赖本地提交
 - 公共 base64 echo 端点只有 `httpbingo.org/base64/{base64url}` 字节级可靠（2026-09 实测 sha256 完全一致）；httpbin.org 的 /base64 对含 `+`/`/` 的标准 base64 一律 404（百分号编码也不行）——构造测试下载地址别用 httpbin
