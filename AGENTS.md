@@ -102,5 +102,6 @@
 - 应用市场包页当前不可访问（发布待审核）——文档里只写"插件市场搜索 PotatoDownload"+GitHub 仓库链接，不放包页 URL
 - Shionlib 仓库检查：husky pre-commit 跑 lint-staged，pre-push 跑全仓 typecheck + 前端/后端/og 单测（后端 jest 很慢，push 需数分钟）；CI 前端门槛 = prettier/eslint/i18n:check/tsc/test:cov（覆盖率阈值 statements 70）
 - 默认下载目录：系统盘 Galgame 文件夹（Plugin.DefaultDownloadPath，Path.GetPathRoot(Environment.SystemDirectory)，一定存在；留空设置项时的回退）
+- **Linux 移植绑定面盘点（2026-09-13，结论：核心已可移植，硬绑定 4 处）**：硬绑定=①TFM net8.0-windows+UseWinUI+RID win-* 与 GalgameManager.WinApp.Base 基类；②插件契约 IPotatoVnApi 用 WinUI 类型（InfoBarSeverity/UIElement），UI 层命运取决于宿主 Linux 走 Uno 还是新框架；③深链激活走 AppInstance.Activated（WindowsAppSDK 单实例），Linux 需换通道；④PackPlugin 用 PowerShell Compress-Archive（仅构建期）。已可移植=InstallRequest/DownloadService/UnpackService/DownloadManager 核心 + Blake3.Managed/SharpCompress 全托管，CoreChecks 以纯 net8.0 链接这些文件并在 Linux 实跑通过。移植小修：DefaultDownloadPath 的 Environment.SystemDirectory、PrepareGameDirectory 路径比较 OrdinalIgnoreCase（Linux 应区分大小写）、IsSafeFileName 拒绝 Windows 保留名（在 Linux 无害偏保守）。插件包里的 WebView2Loader/WindowsAppRuntime.Bootstrap 等原生 DLL 是宿主依赖图的传递垃圾，不碰我们代码路径
 
 <!-- MEMORY END -->
