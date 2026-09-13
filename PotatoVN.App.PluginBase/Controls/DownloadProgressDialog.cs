@@ -127,7 +127,7 @@ public sealed class DownloadProgressDialog : UserControl
         }
         var active = 0;
         foreach (var task in Plugin.DownloadManager.Tasks)
-            if (task.IsActive) active++;
+            if (task.IsListed) active++;
         if (active != _activePanel.Children.Count)
         {
             Rebuild();
@@ -150,7 +150,7 @@ public sealed class DownloadProgressDialog : UserControl
         var activeCount = 0;
         foreach (var task in Plugin.DownloadManager.Tasks)
         {
-            if (!task.IsActive) continue;
+            if (!task.IsListed) continue;
             _activePanel.Children.Add(new TaskRow(task));
             activeCount++;
         }
@@ -196,6 +196,7 @@ public sealed class DownloadProgressDialog : UserControl
         DownloadTaskStage.Completed => "已完成",
         DownloadTaskStage.Failed => "失败",
         DownloadTaskStage.Cancelled => "已取消",
+        DownloadTaskStage.Paused => "已暂停",
         _ => stage.ToString(),
     };
 
@@ -282,7 +283,24 @@ public sealed class DownloadProgressDialog : UserControl
         private readonly TextBlock _rightText;
         private readonly TextBlock _messageText;
         private readonly ProgressBar _progressBar;
+        private readonly Button _pauseButton;
+        private readonly Button _resumeButton;
         private readonly Button _cancelButton;
+
+        /// <summary>Chrome 下载行风格的小图标按钮。</summary>
+        private static Button IconButton(Symbol symbol, string tooltip)
+        {
+            var button = new Button
+            {
+                Content = new SymbolIcon(symbol),
+                Width = 28,
+                Height = 28,
+                Padding = new Thickness(0),
+                VerticalAlignment = VerticalAlignment.Center,
+            };
+            ToolTipService.SetToolTip(button, tooltip);
+            return button;
+        }
 
         public TaskRow(DownloadTask task)
         {
@@ -316,21 +334,29 @@ public sealed class DownloadProgressDialog : UserControl
                 FontSize = 12,
                 TextAlignment = TextAlignment.Right,
             };
-            _cancelButton = new Button
-            {
-                Content = "取消",
-                FontSize = 12,
-                Padding = new Thickness(10, 2, 10, 2),
-                HorizontalAlignment = HorizontalAlignment.Right,
-            };
+            _pauseButton = IconButton(Symbol.Pause, "暂停");
+            _resumeButton = IconButton(Symbol.Play, "继续");
+            _cancelButton = IconButton(Symbol.Cancel, "取消");
+            _pauseButton.Click += (_, _) => _task.Pause();
+            _resumeButton.Click += (_, _) => Plugin.DownloadManager.ResumeTask(_task);
             _cancelButton.Click += (_, _) =>
             {
-                _task.Cancel();
-                _cancelButton.IsEnabled = false;
-                _cancelButton.Content = "取消中…";
+                if (_task.Stage == DownloadTaskStage.Paused)
+                    Plugin.DownloadManager.CancelPausedTask(_task);
+                else
+                    _task.Cancel();
             };
+            var buttonStack = new StackPanel
+            {
+                Orientation = Orientation.Horizontal,
+                Spacing = 4,
+                HorizontalAlignment = HorizontalAlignment.Right,
+            };
+            buttonStack.Children.Add(_pauseButton);
+            buttonStack.Children.Add(_resumeButton);
+            buttonStack.Children.Add(_cancelButton);
             rightStack.Children.Add(_rightText);
-            rightStack.Children.Add(_cancelButton);
+            rightStack.Children.Add(buttonStack);
             Grid.SetColumn(rightStack, 2);
             grid.Children.Add(rightStack);
 
@@ -349,10 +375,16 @@ public sealed class DownloadProgressDialog : UserControl
         {
             _messageText.Text = _task.Message;
             _progressBar.Value = _task.ProgressPercent;
+            // 进度回调停滞超过 2 秒时速度归零显示：肉眼即可分辨「下载侧停滞」与「显示侧冻结」
+            var stalled = _task.Stage == DownloadTaskStage.Downloading
+                && (DateTimeOffset.UtcNow - _task.LastProgressUtc).TotalSeconds > 2;
+            var speed = stalled ? 0 : (long)_task.SpeedBytesPerSec;
             _rightText.Text = _task.Stage == DownloadTaskStage.Downloading && _task.Total > 0
-                ? $"{_task.ProgressPercent:F0}% · {DownloadManager.FormatBytes((long)_task.SpeedBytesPerSec)}/s"
+                ? $"{_task.ProgressPercent:F0}% · {DownloadManager.FormatBytes(speed)}/s"
                 : StageText(_task.Stage);
-            _cancelButton.Visibility = _task.IsActive ? Visibility.Visible : Visibility.Collapsed;
+            _pauseButton.Visibility = _task.IsActive ? Visibility.Visible : Visibility.Collapsed;
+            _resumeButton.Visibility = _task.Stage == DownloadTaskStage.Paused ? Visibility.Visible : Visibility.Collapsed;
+            _cancelButton.Visibility = _task.IsListed ? Visibility.Visible : Visibility.Collapsed;
         }
     }
 }

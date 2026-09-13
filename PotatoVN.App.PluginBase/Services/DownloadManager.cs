@@ -20,6 +20,15 @@ public enum DownloadTaskStage
     Completed,
     Failed,
     Cancelled,
+    Paused,
+}
+
+/// <summary>用户对任务的请求类型：取消（删文件）或暂停（保现场可继续）。</summary>
+public enum CancelRequestKind
+{
+    None,
+    Cancel,
+    Pause,
 }
 
 /// <summary>单个下载任务的可观察状态（供 UI 绑定）。</summary>
@@ -28,9 +37,37 @@ public partial class DownloadTask : ObservableObject
     public InstallRequest Request { get; }
     public string Title => Request.Title;
 
-    /// <summary>用户取消令牌：入队时与插件级 Shutdown 令牌链接。
-    /// 用户主动取消会删除 .part/水位与未完成目录；插件停止（Shutdown）才保留续传现场。</summary>
-    public CancellationTokenSource Cts { get; } = new();
+    /// <summary>用户取消/暂停令牌：入队时与插件级 Shutdown 令牌链接。
+    /// 取消会删除 .part/水位与未完成目录；暂停保留现场可继续；插件停止（Shutdown）保留续传现场。</summary>
+    public CancellationTokenSource Cts { get; private set; } = new();
+
+    /// <summary>最后一次进度回调的时间（UI 据此把停滞的速度归零显示）。</summary>
+    public DateTimeOffset LastProgressUtc { get; set; } = DateTimeOffset.UtcNow;
+
+    /// <summary>暂存压缩包与解压目录（暂停后被取消时的清理依据）。</summary>
+    internal string? PackPath { get; set; }
+    internal string? GamePath { get; set; }
+
+    public CancelRequestKind CancelRequest { get; private set; } = CancelRequestKind.None;
+
+    public void Cancel()
+    {
+        CancelRequest = CancelRequestKind.Cancel;
+        Cts.Cancel();
+    }
+
+    public void Pause()
+    {
+        CancelRequest = CancelRequestKind.Pause;
+        Cts.Cancel();
+    }
+
+    /// <summary>从暂停恢复：换新令牌（旧的已触发不可复用），清请求标记。</summary>
+    internal void ResetForResume()
+    {
+        CancelRequest = CancelRequestKind.None;
+        Cts = new CancellationTokenSource();
+    }
 
     [ObservableProperty] private DownloadTaskStage _stage = DownloadTaskStage.Pending;
     [ObservableProperty] private long _current;
@@ -44,13 +81,14 @@ public partial class DownloadTask : ObservableObject
         Total = (long)request.Size;
     }
 
-    public void Cancel() => Cts.Cancel();
-
     /// <summary>进度百分比 0-100。</summary>
     public double ProgressPercent => Total <= 0 ? 0 : (double)Current / Total * 100;
 
     public bool IsActive => Stage is DownloadTaskStage.Pending or DownloadTaskStage.Downloading
         or DownloadTaskStage.Verifying or DownloadTaskStage.Unpacking or DownloadTaskStage.Importing;
+
+    /// <summary>是否应在下载面板列出：活动任务 + 已暂停（可继续/可取消）。</summary>
+    public bool IsListed => IsActive || Stage == DownloadTaskStage.Paused;
 }
 
 /// <summary>
@@ -102,7 +140,7 @@ public class DownloadManager
         }
         catch (OperationCanceledException)
         {
-            FinishCancelled(task);
+            FinishWaitCancelled(task);
             _hostApi.InvokeOnMainThread(BumpActiveCount);
             return;
         }
@@ -114,6 +152,59 @@ public class DownloadManager
         {
             _gate.Release();
         }
+    }
+
+    /// <summary>排队（未开始下载）时被取消/暂停的收尾。</summary>
+    private void FinishWaitCancelled(DownloadTask task)
+    {
+        if (task.CancelRequest == CancelRequestKind.Pause && !_shutdown.IsCancellationRequested)
+        {
+            task.Stage = DownloadTaskStage.Paused;
+            task.Message = "已暂停";
+            return;
+        }
+        FinishCancelled(task);
+    }
+
+    /// <summary>从暂停继续（对标 Chrome 下载的继续）：复用同一任务对象，下载侧凭 .part+水位自动续传。</summary>
+    public void ResumeTask(DownloadTask task) => _ = Task.Run(() => ResumeCoreAsync(task));
+
+    private async Task ResumeCoreAsync(DownloadTask task)
+    {
+        if (task.Stage != DownloadTaskStage.Paused) return;
+        task.ResetForResume();
+        task.Stage = DownloadTaskStage.Pending;
+        task.Message = "等待中";
+        _hostApi.InvokeOnMainThread(BumpActiveCount);
+        using var linked = CancellationTokenSource.CreateLinkedTokenSource(_shutdown.Token, task.Cts.Token);
+        try
+        {
+            await _gate.WaitAsync(linked.Token);
+        }
+        catch (OperationCanceledException)
+        {
+            FinishWaitCancelled(task);
+            _hostApi.InvokeOnMainThread(BumpActiveCount);
+            return;
+        }
+        try
+        {
+            await ProcessAsync(task, linked.Token);
+        }
+        finally
+        {
+            _gate.Release();
+        }
+    }
+
+    /// <summary>取消一个已暂停的任务：令牌已无监听者，直接收尾并清理现场。</summary>
+    public void CancelPausedTask(DownloadTask task)
+    {
+        if (task.Stage != DownloadTaskStage.Paused) return;
+        task.Cancel(); // 记录语义（当前无等待方）
+        FinishCancelled(task);
+        CleanupCancelledArtifacts(task.PackPath, task.GamePath);
+        _hostApi.InvokeOnMainThread(BumpActiveCount);
     }
 
     /// <summary>同一资源是否已有活动任务；遍历 Tasks，只能在主线程调用。</summary>
@@ -128,7 +219,7 @@ public class DownloadManager
     private void FinishCancelled(DownloadTask task)
     {
         task.SpeedBytesPerSec = 0;
-        if (task.Cts.IsCancellationRequested && !_shutdown.IsCancellationRequested)
+        if (task.CancelRequest == CancelRequestKind.Cancel && !_shutdown.IsCancellationRequested)
         {
             task.Stage = DownloadTaskStage.Cancelled;
             task.Message = "已取消";
@@ -235,10 +326,21 @@ public class DownloadManager
             var stagingDir = Path.Combine(downloadDir, ".potatodownload");
             Directory.CreateDirectory(stagingDir);
             packPath = Path.Combine(stagingDir, task.Request.FileName);
+            task.PackPath = packPath;
 
             // 2. 下载（多线程分块 + 断点续传），速度做 EMA 平滑，UI 更新限流 500ms
             task.Stage = DownloadTaskStage.Downloading;
             task.Message = "下载中...";
+            // 心跳日志：排查「弹窗冻结」时分辨是模型停滞（下载侧）还是显示链路问题（UI 侧）
+            using var heartbeat = new Timer(_ =>
+            {
+                try
+                {
+                    _hostApi.Log(InfoBarSeverity.Warning,
+                        $"PotatoDownload: heartbeat ({task.Title}): {task.Stage} {FormatBytes(task.Current)}/{FormatBytes(task.Total)}");
+                }
+                catch { /* 日志失败不影响下载 */ }
+            }, null, TimeSpan.FromSeconds(30), TimeSpan.FromSeconds(30));
             var watch = System.Diagnostics.Stopwatch.StartNew();
             long lastTickBytes = 0, lastTickMs = 0;
             var lastUiMs = -UiUpdateInterval.TotalMilliseconds;
@@ -262,9 +364,11 @@ public class DownloadManager
                             task.Current = current;
                             task.Total = total;
                             task.SpeedBytesPerSec = smoothedSpeed;
+                            task.LastProgressUtc = DateTimeOffset.UtcNow;
                             task.Message = $"下载中 {FormatBytes(current)} / {FormatBytes(total)} · {FormatBytes((long)smoothedSpeed)}/s";
                         }
-                    }, ct);
+                    }, ct,
+                    msg => _hostApi.Log(InfoBarSeverity.Warning, $"PotatoDownload: {msg}"));
             }
 
             // 3. 校验：失败的文件必须删掉，否则下次会被当作已下载完成直接复用，永远校验失败
@@ -286,6 +390,7 @@ public class DownloadManager
             task.Message = "解压中...";
             var gameDirName = UnpackService.ResolveGameDirectoryName(task.Request, packPath);
             gamePath = UnpackService.PrepareGameDirectory(downloadDir, gameDirName);
+            task.GamePath = gamePath;
             await UnpackService.UnpackAsync(task.Request, packPath, gamePath,
                 (finished, total) => task.Message = total > 0 ? $"解压中 {finished}/{total}" : $"解压中 {finished} 个文件",
                 ct);
@@ -309,10 +414,20 @@ public class DownloadManager
         }
         catch (OperationCanceledException) when (ct.IsCancellationRequested)
         {
-            FinishCancelled(task);
-            // 用户主动取消 = 放弃这个文件：清掉暂存与未完成目录；插件停止则保留现场可续传
-            if (task.Cts.IsCancellationRequested && !_shutdown.IsCancellationRequested)
-                CleanupCancelledArtifacts(packPath, gamePath);
+            if (task.CancelRequest == CancelRequestKind.Pause && !_shutdown.IsCancellationRequested)
+            {
+                // 暂停：保留下载现场（.part+水位/未完成目录），不做历史记录，等待继续
+                task.SpeedBytesPerSec = 0;
+                task.Stage = DownloadTaskStage.Paused;
+                task.Message = "已暂停";
+            }
+            else
+            {
+                FinishCancelled(task);
+                // 用户主动取消 = 放弃这个文件：清掉暂存与未完成目录；插件停止则保留现场可续传
+                if (task.CancelRequest == CancelRequestKind.Cancel && !_shutdown.IsCancellationRequested)
+                    CleanupCancelledArtifacts(packPath, gamePath);
+            }
         }
         catch (Exception e)
         {

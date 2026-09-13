@@ -84,8 +84,10 @@ public class DownloadService : IDisposable
     /// <param name="targetPath">最终文件存放路径（下载完成即挪到此处）</param>
     /// <param name="onProgress">进度回调 (已提交字节, 总字节)</param>
     /// <param name="ct">取消令牌</param>
+    /// <param name="log">可选诊断日志（下载路径决策），仅落文字不携带敏感信息</param>
     public async Task DownloadAsync(InstallRequest request, string targetPath,
-        Action<long, long>? onProgress = null, CancellationToken ct = default)
+        Action<long, long>? onProgress = null, CancellationToken ct = default,
+        Action<string>? log = null)
     {
         if (request.IsExpired(DateTimeOffset.Now))
             throw new DownloadException("下载直链已过期，请重新从来源提供方获取链接");
@@ -94,6 +96,7 @@ public class DownloadService : IDisposable
         if (File.Exists(targetPath) && new FileInfo(targetPath).Length == totalBytes)
         {
             // 上次已下载完整（例如在解压/入库阶段失败）——直接复用，由调用方重新校验哈希
+            log?.Invoke("target already complete, skip download");
             onProgress?.Invoke(totalBytes, totalBytes);
             return;
         }
@@ -108,11 +111,20 @@ public class DownloadService : IDisposable
         try
         {
             if (IsAlreadyComplete(partPath, watermarkPath, totalBytes))
+            {
+                log?.Invoke("reuse complete .part, skip download");
                 onProgress?.Invoke(totalBytes, totalBytes);
+            }
             else if (await ProbeRangeAsync(request.Url, ct))
+            {
+                log?.Invoke($"probe: range supported, chunked download ({(totalBytes + ChunkSize - 1) / ChunkSize} chunks)");
                 await DownloadChunkedAsync(request, partPath, watermarkPath, onProgress, ct);
+            }
             else
+            {
+                log?.Invoke("probe: range NOT supported, sequential download");
                 await DownloadSequentialAsync(request, partPath, watermarkPath, onProgress, ct);
+            }
         }
         catch (OperationCanceledException) when (!ct.IsCancellationRequested)
         {
