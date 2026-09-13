@@ -83,16 +83,21 @@
 <body>
 <main>
   <h1>PotatoDownload 推送测验平台</h1>
-  <div class="sub">一键构造并发送 <code>potato-vn://install</code> 深链推送，验证插件的下载 → 校验 → 解压 → 入库全链路。直接用浏览器打开本文件即可（无需联网加载页面资源）。</div>
+  <div class="sub">一键构造并发送 <code>potato-vn://install</code> 深链推送，验证插件的下载 → 校验 → 解压 → 入库全链路。构链与触发逻辑逐字移植自 Shionlib 前端，推送行为与真实网站一致。在线地址 <a href="https://luoyuxiaoxiao.github.io/PotatoDownload/">luoyuxiaoxiao.github.io/PotatoDownload</a>，也可用浏览器直接打开本文件。</div>
 
   <h2>前置条件</h2>
   <div class="card">
     <ol class="prereq">
       <li>PotatoVN 处于运行状态（窗口或系统托盘均可）。</li>
       <li>PotatoDownload 插件已安装并启用。安装方式：PotatoVN → 插件页 → 顶部「从本地压缩包安装」，选择你下载的 <code>plugin.pvnplugin.zip</code>。</li>
-      <li>除「仅提示」用例外，请确认插件设置中的「自动下载」为开启状态。</li>
-      <li>测试载荷托管于公共 echo 服务（默认 httpbingo.org），需要能访问公网。</li>
+      <li>插件设置「自动下载」默认关闭：每次推送先弹「确认下载」对话框，点「下载」才开始。要验证静默下载请先在设置里打开它。</li>
+      <li>测试载荷由本站（GitHub Pages）公网托管；插件按解析后的 IP 拒绝本机/内网地址，所以不能用本地服务器提供载荷。</li>
     </ol>
+    <div class="row" style="margin-top:8px">
+      <label style="margin:0;white-space:nowrap">模拟签名等待（ms）</label>
+      <input id="f_delay" type="number" value="500" style="width:120px">
+      <span class="hint">Shionlib 点击后先 await 后端签发直链再触发深链。浏览器的用户手势有时效（Chrome 约 5 秒），填 6000 以上可验证超时后深链是否仍被放行。</span>
+    </div>
   </div>
 
   <h2>预设测试用例</h2>
@@ -117,12 +122,13 @@
     <div class="grid-3">
       <div>
         <label>provider *</label>
-        <input id="f_provider" value="test">
+        <input id="f_provider" value="shionlib">
+        <div class="hint">Shionlib 固定发 <code>shionlib</code>；改动只用于测试 provider 校验。</div>
       </div>
       <div>
         <label>resource_id *</label>
         <input id="f_resid" value="test-e2e-001">
-        <div class="hint"><label style="display:inline;margin:0"><input type="checkbox" id="f_unique" checked style="width:auto;vertical-align:-1px"> 发送时自动附加时间戳后缀，避免被插件永久去重</label></div>
+        <div class="hint"><label style="display:inline;margin:0"><input type="checkbox" id="f_unique" checked style="width:auto;vertical-align:-1px"> 发送时自动附加时间戳后缀，避免与进行中的同名任务撞车</label></div>
       </div>
       <div>
         <label>file_name *</label>
@@ -131,9 +137,10 @@
     </div>
     <div class="grid-3">
       <div>
-        <label>archive_format *</label>
+        <label>archive_format（Shionlib 按 file_name 推断）</label>
         <select id="f_format">
-          <option selected>zip</option><option>7z</option><option>rar</option><option>tar</option>
+          <option value="" selected>（按 file_name 推断）</option>
+          <option>zip</option><option>7z</option><option>rar</option><option>tar</option>
           <option>tar.gz</option><option>tar.bz2</option><option>tar.xz</option><option>tar.zst</option>
         </select>
       </div>
@@ -164,6 +171,17 @@
         <input id="f_password">
       </div>
     </div>
+    <div class="grid-3">
+      <div>
+        <label>vndb_id（可选）</label>
+        <input id="f_vndb" value="4">
+        <div class="hint">Shionlib 会自动补 <code>v</code> 前缀（4 → v4）。</div>
+      </div>
+      <div>
+        <label>hikarinagi_id（可选）</label>
+        <input id="f_hika" type="number">
+      </div>
+    </div>
     <div class="err" id="formErr"></div>
     <div class="urlbox mono" id="urlPreview"></div>
     <div class="row">
@@ -174,7 +192,7 @@
 
   <h2>发送历史</h2>
   <div class="card">
-    <p class="hint">插件对 30 秒内完全相同的链接只处理一次；同一 provider + resource_id + checksum + url 的推送永久去重。预设用例和勾选「附加时间戳后缀」的自定义推送每次都会生成新 resource_id，因此总能被处理。</p>
+    <p class="hint">插件对 30 秒内完全相同的链接只处理一次，并对仍在进行中的同一 provider + resource_id + checksum + url 任务去重（失败后可直接重推）。预设用例和勾选「附加时间戳后缀」的自定义推送每次都会生成新 resource_id，因此总能被处理。</p>
     <ul id="historyList"></ul>
     <button class="secondary" id="btnClearHistory">清空历史</button>
   </div>
@@ -185,7 +203,7 @@
     <p>② PotatoVN 侧边栏「下载」按钮 → 弹窗内实时任务列表与进度条。</p>
     <p>③ 游戏库：成功用例会新增一个游戏条目（按 bgm_id 刮削）。</p>
     <p>④ 日志文件：PotatoVN 数据目录下 <code>Logs\log.txt</code>，含 <code>PotatoDownload:</code> 前缀的诊断记录（Warning 级别始终写入）。</p>
-    <p>⑤ 清理测试残留：删除游戏库中的测试条目；下载目录（默认为插件目录下 <code>downloads\test_game\</code>）可手动删除。</p>
+    <p>⑤ 清理测试残留：删除游戏库中的测试条目；下载目录（默认为系统盘 <code>Galgame\</code>，压缩包暂存在其下 <code>.potatodownload\</code>）可手动删除。</p>
   </div>
 
   <h2>协议参数速查（v1）</h2>
@@ -219,7 +237,8 @@ const PAYLOAD = {
   sha256: "0cdfccdc7ca8af40cc94c15f20de7d0e940f0ab731bed16cef34acafcdad4754",
 };
 
-const ENDPOINT = "https://httpbingo.org/base64/";
+// 载荷经 GitHub Pages 公网直链下发（插件按解析 IP 拒绝本机/内网地址，本地服务器不可用）
+const PAYLOAD_URL = "https://luoyuxiaoxiao.github.io/PotatoDownload/payload/test_game.zip";
 const EXPIRES_FAR = 2000000000; // 2033-05-18
 
 function payloadBytes() {
@@ -243,32 +262,97 @@ async function upgradeSha256() {
   } catch { /* 保持静态值 */ }
 }
 
-function defaultDownloadUrl() { return ENDPOINT + PAYLOAD.base64url; }
+function defaultDownloadUrl() { return PAYLOAD_URL; }
 
+// ===== 与 Shionlib 完全一致的构链 / 触发逻辑 =====
+// 逐字移植自 shionlib apps/frontend/components/game/download/helpers/{protocol,potatovn}.ts（仅去掉 TS 类型）。
+// 这一段不要改：改了就不再是真实推送机制。测试专用开关见下方 buildInstallUrl 包装层。
+const getArchiveFormat = (fileName) => {
+  const lower = fileName.toLowerCase()
+  if (lower.endsWith('.tar.gz') || lower.endsWith('.tgz')) return 'tar.gz'
+  if (lower.endsWith('.tar.bz2') || lower.endsWith('.tbz2')) return 'tar.bz2'
+  if (lower.endsWith('.tar.xz') || lower.endsWith('.txz')) return 'tar.xz'
+  if (lower.endsWith('.tar.zst') || lower.endsWith('.tzst')) return 'tar.zst'
+  if (lower.endsWith('.tar')) return 'tar'
+  if (lower.endsWith('.zip')) return 'zip'
+  if (lower.endsWith('.rar')) return 'rar'
+  if (lower.endsWith('.7z')) return '7z'
+  return 'none'
+}
+
+const openProtocolUrl = (protocolUrl) => {
+  const a = document.createElement('a')
+  a.href = protocolUrl
+  a.style.display = 'none'
+  document.body.appendChild(a)
+  a.click()
+  document.body.removeChild(a)
+}
+
+const ensureVndbPrefix = (vndbId) => (vndbId.startsWith('v') ? vndbId : `v${vndbId}`)
+
+const buildPotatoVNUrl = ({
+  resourceId,
+  url,
+  fileName,
+  size,
+  checksumAlgo,
+  checksum,
+  expiresAt,
+  title,
+  bangumiId,
+  vndbId,
+  hikarinagiId,
+}) => {
+  const params = new URLSearchParams({
+    v: '1',
+    provider: 'shionlib',
+    resource_id: String(resourceId),
+    url,
+    file_name: fileName,
+    archive_format: getArchiveFormat(fileName),
+    size: String(size),
+    checksum_algo: checksumAlgo,
+    checksum,
+    expires_at: String(expiresAt),
+    bgm_id: bangumiId,
+    title,
+  })
+
+  if (vndbId) params.set('vndb_id', ensureVndbPrefix(vndbId))
+  if (hikarinagiId) params.set('hikarinagi_id', String(hikarinagiId))
+
+  return `potato-vn://install?${params.toString()}`
+}
+// ===== 移植结束 =====
+
+// 测试专用包装：先生成真实链接，再施加反例开关（provider 覆盖 / 不校验 / 缺参 / archive_password / archive_format 覆盖）。
+// 用 URLSearchParams 原地改写，编码与参数顺序保持与 Shionlib 一致。
 function buildInstallUrl(p) {
-  const pairs = [
-    ["v", "1"], ["provider", p.provider], ["resource_id", p.resourceId],
-    ["url", p.url], ["file_name", p.fileName], ["archive_format", p.archiveFormat],
-    ["size", String(p.size)],
-  ];
-  if (p.checksumAlgo) pairs.push(["checksum_algo", p.checksumAlgo], ["checksum", p.checksum]);
-  pairs.push(["expires_at", String(p.expiresAt)], ["bgm_id", p.bgmId], ["title", p.title]);
-  if (p.archivePassword) pairs.push(["archive_password", p.archivePassword]);
-  if (p.omit) for (const k of p.omit) {
-    const i = pairs.findIndex(x => x[0] === k);
-    if (i >= 0) pairs.splice(i, 1);
-  }
-  return "potato-vn://install?" + pairs.map(([k, v]) => k + "=" + encodeURIComponent(v)).join("&");
+  const built = buildPotatoVNUrl({
+    resourceId: p.resourceId, url: p.url, fileName: p.fileName, size: p.size,
+    checksumAlgo: p.checksumAlgo || "", checksum: p.checksum || "",
+    expiresAt: p.expiresAt, title: p.title, bangumiId: p.bgmId,
+    vndbId: p.vndbId, hikarinagiId: p.hikarinagiId,
+  });
+  const i = built.indexOf("?");
+  const q = new URLSearchParams(built.slice(i + 1));
+  if (p.provider && p.provider !== "shionlib") q.set("provider", p.provider);
+  if (!p.checksumAlgo) { q.delete("checksum_algo"); q.delete("checksum"); }
+  if (p.archiveFormat) q.set("archive_format", p.archiveFormat);
+  if (p.archivePassword) q.set("archive_password", p.archivePassword);
+  for (const k of p.omit || []) q.delete(k);
+  return built.slice(0, i + 1) + q.toString();
 }
 
 function validPresetParams(overrides = {}) {
   // E2E 必须使用真实存在且可联网刮削的游戏（宿主按 title 在线刮削，查无此游戏会报错），
-  // 这里统一用 CLANNAD（bgm subject 13）；测试后请删除库中 CLANNAD 条目及其安装路径。
+  // 这里统一用 CLANNAD（bgm subject 13 / vndb v4）；测试后请删除库中 CLANNAD 条目及其安装路径。
   return Object.assign({
-    provider: "test", resourceId: "test-e2e-001",
-    url: defaultDownloadUrl(), fileName: "CLANNAD.zip", archiveFormat: "zip",
+    resourceId: "test-e2e-001",
+    url: defaultDownloadUrl(), fileName: "CLANNAD.zip",
     size: PAYLOAD.size, checksumAlgo: "sha256", checksum: PAYLOAD.sha256,
-    expiresAt: EXPIRES_FAR, bgmId: "13", title: "CLANNAD",
+    expiresAt: EXPIRES_FAR, bgmId: "13", vndbId: "4", title: "CLANNAD",
   }, overrides);
 }
 
@@ -276,7 +360,7 @@ const PRESETS = [
   {
     cls: "ok", name: "完整流程（E2E）",
     desc: "以真实游戏条目 CLANNAD（bgm_id=13）推送。验证 下载 → sha256 校验 → 解压 → 入库 → 刮削 全链路。",
-    expect: "弹条提示「开始下载」→ 侧边栏「下载」弹窗可见任务推进 → 提示「完成」→ 库中 CLANNAD 条目新增安装路径。测试后请删除该条目。",
+    expect: "先弹「确认下载」对话框（自动下载默认关）→ 点「下载」后侧边栏「下载」弹窗可见任务推进 → 提示「完成」→ 库中 CLANNAD 条目新增安装路径并带 vndb v4。测试后请删除该条目。",
     params: () => validPresetParams(),
   },
   {
@@ -304,19 +388,21 @@ const PRESETS = [
     params: () => validPresetParams({ resourceId: "test-missing-001", omit: ["size"] }),
   },
   {
-    cls: "ok", name: "确认下载（自动下载关闭时）",
-    desc: "先在插件设置里把「自动下载」关掉，再发送本用例（参数与 E2E 相同）。",
-    expect: "弹出「确认下载」对话框；点击「下载」后才开始，点「取消」则忽略。",
+    cls: "ok", name: "静默下载（自动下载开启时）",
+    desc: "先在插件设置里把「自动下载」打开，再发送本用例（参数与 E2E 相同）。",
+    expect: "不弹确认框，直接弹条「开始下载」并自动打开下载面板。",
     params: () => validPresetParams({ resourceId: "test-notify-001" }),
   },
 ];
 
-function send(label, url) {
+async function send(label, url) {
   const history = JSON.parse(localStorage.getItem("pvnPushHistory") || "[]");
   history.unshift({ time: new Date().toLocaleString(), label, url });
   localStorage.setItem("pvnPushHistory", JSON.stringify(history.slice(0, 20)));
   renderHistory();
-  window.location.href = url;
+  // Shionlib 流程：点击 → await 后端签发直链 → 隐藏 <a> 点击触发深链。这里用可调延时模拟签名等待。
+  await new Promise(r => setTimeout(r, Math.max(0, Number(F("f_delay").value) || 0)));
+  openProtocolUrl(url);
 }
 
 function renderPresets() {
@@ -331,7 +417,7 @@ function renderPresets() {
     const btn = document.createElement("button");
     btn.textContent = "发送此推送";
     btn.onclick = () => {
-      // 每次点击附加唯一后缀，避免被插件的永久去重（provider+resource_id+checksum+url）拦下
+      // 每次点击附加唯一后缀，避免与仍在进行中的同名任务撞车（插件只对进行中任务去重）
       const params = p.params();
       params.resourceId += "-" + Date.now().toString(36);
       send(p.name, buildInstallUrl(params));
@@ -366,6 +452,8 @@ function readForm() {
     archivePassword: F("f_password").value,
     bgmId: F("f_bgm").value.trim(),
     title: F("f_title").value.trim(),
+    vndbId: F("f_vndb").value.trim(),
+    hikarinagiId: F("f_hika").value.trim(),
   };
 }
 
@@ -390,6 +478,7 @@ function validate(p) {
   if (!p.bgmId) return "bgm_id 不能为空";
   if (!p.title) return "title 不能为空";
   if (p.archivePassword && /[\r\n\0]/.test(p.archivePassword)) return "archive_password 包含非法字符";
+  if (p.hikarinagiId && !/^\d+$/.test(p.hikarinagiId)) return "hikarinagi_id 必须为数字";
   return null;
 }
 
@@ -397,14 +486,7 @@ function refreshForm() {
   const p = readForm();
   const err = validate(p);
   F("formErr").textContent = err || "";
-  const preview = err ? "（修正上方问题后生成链接）"
-    : buildInstallUrl({
-        provider: p.provider, resourceId: p.resourceId, url: p.url,
-        fileName: p.fileName, archiveFormat: p.archiveFormat, size: p.size,
-        checksumAlgo: p.checksumAlgo || null, checksum: p.checksum,
-        expiresAt: p.expiresAt, bgmId: p.bgmId, title: p.title,
-        archivePassword: p.archivePassword || null,
-      });
+  const preview = err ? "（修正上方问题后生成链接）" : buildInstallUrl(p);
   F("urlPreview").textContent = preview;
   return err ? null : preview;
 }
@@ -434,13 +516,7 @@ function init() {
     F("formErr").textContent = err || "";
     if (err) return;
     if (F("f_unique").checked) p.resourceId += "-" + Date.now().toString(36);
-    const url = buildInstallUrl({
-      provider: p.provider, resourceId: p.resourceId, url: p.url,
-      fileName: p.fileName, archiveFormat: p.archiveFormat, size: p.size,
-      checksumAlgo: p.checksumAlgo || null, checksum: p.checksum,
-      expiresAt: p.expiresAt, bgmId: p.bgmId, title: p.title,
-      archivePassword: p.archivePassword || null,
-    });
+    const url = buildInstallUrl(p);
     F("urlPreview").textContent = url;
     send("自定义推送", url);
   };

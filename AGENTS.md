@@ -63,12 +63,12 @@
 - 参考实现：ReinaManager `src-tauri/src/install/`（protocol/download/workflow），Shionlib `apps/frontend/components/game/download/helpers/reina.ts`
 - 下载架构：DownloadService 多线程分块（4 连接 × 4MB 块，`File.OpenHandle`+`RandomAccess` 定位写，Range 探测失败退化为单连接续传），.part + .part.watermark 断点续传（水位=从头连续已落盘字节）；压缩包与 .part 放在下载目录下 `.potatodownload\` 暂存子目录（不碰用户同名文件）；哈希校验在 DownloadManager 做，失败即删文件；DownloadManager 串行队列 + ObservableCollection<DownloadTask>（增删遍历只在主线程）供 UI 绑定；去重只对活动任务，失败后可再推重试
 - UI：侧边栏按钮"下载"→ ContentDialog 弹窗（DownloadProgressDialog，纯C#，Chrome 风格：进行中+历史记录两区，速度 EMA 平滑 + 500ms 限流），无独立页面；设置页 UserControl1（纯C#）；主题资源查找走 Helper/PluginTheme
-- 交互语义：自动下载 ON=立即下载并自动弹下载面板；OFF=弹"确认下载"ContentDialog；**全部弹窗（确认/下载面板/测试面板）经 Plugin_Ui 的 EnqueueDialog 串行协调器**——ContentDialog 同时只能开一个，各自 ShowAsync 会撞车静默吞请求（2026-09 远程报错实证）；推送到达自动弹面板是**宿主 DefaultActivationHandler 导航不可抑制**的替代方案（插件 API 无法阻止跳起始页）
+- 交互语义：自动下载 ON=立即下载并自动弹下载面板；OFF=弹"确认下载"ContentDialog；**全部弹窗（确认/下载面板）经 Plugin_Ui 的 EnqueueDialog 串行协调器**——ContentDialog 同时只能开一个，各自 ShowAsync 会撞车静默吞请求（2026-09 远程报错实证）；推送到达自动弹面板是**宿主 DefaultActivationHandler 导航不可抑制**的替代方案（插件 API 无法阻止跳起始页）
 - 断点续传坑：.part+水位在失败中断后会残留；DownloadAsync 开头对"水位与文件大小都达预期"的 .part 直接复用跳过下载；DownloadSequentialAsync 里 committed>0 但响应不是 206（服务端忽略 Range 整包返回）必须清零从头覆盖，否则重复追加成 2 倍大小（2026-09 实测 363→726）
 - 下载历史持久化在 PluginData.History（get-only ObservableCollection，STJ 可 populate；集合变更不触发 PropertyChanged，需 Plugin.SaveDataNow() 手动保存）；侧边栏按钮状态切换靠 Unregister+Register（宿主无原地更新接口）
-- DevReportInfo 已在 Plugin.cs 实现（上传到应用市场/正式版前必须改为空实现）
-- 测验平台：repo/TestPlatform/index.html（file:// 直开；E2E/过期/坏校验/SSRF/缺参/确认下载预设 + 自定义构造器 + 发送历史）；载荷 payload/test_game.zip（363B，含 CLANNAD/ 顶层目录，改内容后跑 make-payload.ps1 并更新页面 PAYLOAD 常量）；宿主侧安装入口：插件页"从本地压缩包安装"（AddPluginFromLocalZip），可直接选 artifacts/plugin.pvnplugin.zip
-- **测试功能已内置进插件**：侧边栏"推送测试"按钮 → TestPushDialog（Helper/TestPush.cs 构造 6 种预设深链，ShellExecute 触发，等效浏览器点击）。**发布应用市场前必须移除**（与 DevReportInfo 空实现同级要求）；用户够不到构建机 C 盘，一切交付只能走 upload_test_build 的公网链接
+- DevReportInfo 自 v0.1.0 起为空实现（plan/main 一致）；需要远程诊断时临时恢复上报，发布前改回
+- 测验网站：repo/docs/index.html，GitHub Pages 从 plan 分支 /docs 发布（https://luoyuxiaoxiao.github.io/PotatoDownload/），也可 file:// 直开；构链/触发逻辑逐字移植 Shionlib helpers/{protocol,potatovn}.ts（URLSearchParams 编码 + 隐藏 a 点击 + 可调"签名等待"延时），**移植段不要改**，测试开关（provider 覆盖/缺参/不校验/密码/格式覆盖）只在 buildInstallUrl 包装层（等价性自检 `Tests/SiteCheck/check.ts`，deno 对照本机 Shionlib 克隆逐字节比对，改页面构链后必跑）；载荷 docs/payload/test_game.zip 经 Pages 公网直链下发（SSRF 修复后本地服务器不可用），改载荷后跑 make-payload.ps1 并更新页面 PAYLOAD 常量；宿主侧安装入口：插件页"从本地压缩包安装"（AddPluginFromLocalZip）
+- 插件内推送测试（侧边栏按钮/TestPushDialog/Helper/TestPush.cs）已于 2026-09-13 移除，测验统一走 docs 网站，发布前不再需要删测试代码
 
 ### Feedback / Lessons
 <!-- 用户纠正过的做法 + 原因。例：- 不要 mock 数据库测试，原因：上次 mock 通过但生产迁移失败 -->
@@ -93,9 +93,9 @@
 <!-- 外部资源指针。例：- 报错日志查 Grafana: grafana.internal/d/plugin-runtime -->
 - Shionlib 仓库：github.com/Ringyuki/shionlib；ReinaManager：github.com/huoshen80/ReinaManager
 - 本插件远程仓库：github.com/luoyuxiaoxiao/PotatoDownload（main 与 plan 均已推送；用户明确要求 push 到 main）
-- **分支分工（用户约定）：plan=开发线（保留推送测试功能），main=发布线（无测试功能，DevReportInfo 空实现）**；v0.1.0 已发布到应用市场（tag v0.1.0，包页 plugin.api.potatovn.net/pvn-plugin/package/dfb57882-7b2f-4db3-8fe8-5f3517d1f4c8/0.1.0）
+- **分支分工（用户约定）：plan=开发线，main=发布线**；2026-09-13 起两分支插件代码一致（插件内测试功能已移除，DevReportInfo 空实现），plan 额外承载 docs/ 测验网站并作为 GitHub Pages 发布源；v0.1.0 已发布到应用市场（tag v0.1.0，包页 plugin.api.potatovn.net/pvn-plugin/package/dfb57882-7b2f-4db3-8fe8-5f3517d1f4c8/0.1.0）
 - publish_plugin 流程：build_plugin → upload_test_build 拿 artifact_id → publish_plugin(artifact_id, version, changelog, plugin_info)；**首次发布必须先随调用提交 plugin_info**（name/description/author/homepage），否则 400 "Plugin info must be submitted before publishing"
-- 后续计划：推送测试拆成独立插件（新插件 ID/工作区）
+- Windows 编译/E2E 由用户手动进行（本机 Linux 无法编译 WinUI 文件；用户有 Azure CLI，可临时开 Windows VM），AI 只交付源码改动并等用户回传构建结果，不要自行搭 CI 或开 VM
 - **Shionlib 上游支持 PR（2026-09-13 已在 fork 上完成）**：本地克隆 ~/Projects/scratch/shionlib（origin=fork SSH，upstream=Ringyuki），分支 feat/potatovn-download 已推到 fork；改法完全镜像上游 #13 ReinaManager（helpers/potatovn.ts + ways/PotatoVN.tsx + settings/PotatoVN.tsx + store showPotatoVN + zh/en/ja 文案 + guides/potatovn-download.mdx），PR 描述草稿在 ~/Projects/scratch/shionlib-pr-body.md；**用户要求：不要改动上游已有文件如 reina.ts（别人的源码），只做新增+接线**；已开 PR #18 到上游 `dev` 分支（仓库 CI 只对 main 触发，PR 上无自动检查，靠本地 format/lint/i18n/tsc/test:cov 全过）；frontmatter 作者信息已补（uid 8395、头像 t.shionlib.com/user/8395/avatar/59405d19-…webp），banner 复用 potatovn-sync 的图；feat/partner-download-api 是后端机器鉴权 API，与深链推送无关，不必模仿
 - 应用市场包页当前不可访问（发布待审核）——文档里只写"插件市场搜索 PotatoDownload"+GitHub 仓库链接，不放包页 URL
 - Shionlib 仓库检查：husky pre-commit 跑 lint-staged，pre-push 跑全仓 typecheck + 前端/后端/og 单测（后端 jest 很慢，push 需数分钟）；CI 前端门槛 = prettier/eslint/i18n:check/tsc/test:cov（覆盖率阈值 statements 70）
