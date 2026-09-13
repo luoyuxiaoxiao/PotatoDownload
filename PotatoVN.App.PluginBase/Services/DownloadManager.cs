@@ -19,6 +19,7 @@ public enum DownloadTaskStage
     Importing,
     Completed,
     Failed,
+    Cancelled,
 }
 
 /// <summary>单个下载任务的可观察状态（供 UI 绑定）。</summary>
@@ -26,6 +27,9 @@ public partial class DownloadTask : ObservableObject
 {
     public InstallRequest Request { get; }
     public string Title => Request.Title;
+
+    /// <summary>用户取消令牌：入队时与插件级 Shutdown 令牌链接；取消后 .part 与水位保留，重推可续传。</summary>
+    public CancellationTokenSource Cts { get; } = new();
 
     [ObservableProperty] private DownloadTaskStage _stage = DownloadTaskStage.Pending;
     [ObservableProperty] private long _current;
@@ -38,6 +42,8 @@ public partial class DownloadTask : ObservableObject
         Request = request;
         Total = (long)request.Size;
     }
+
+    public void Cancel() => Cts.Cancel();
 
     /// <summary>进度百分比 0-100。</summary>
     public double ProgressPercent => Total <= 0 ? 0 : (double)Current / Total * 100;
@@ -78,30 +84,59 @@ public class DownloadManager
 
     /// <summary>
     /// 收到新推送时入队并开始处理。同一资源已有活动任务时忽略；
-    /// 任务结束后（含失败）再次推送即可重试。
+    /// 任务结束后（含失败/取消）再次推送即可重试。
+    /// 入口一律落到线程池：调用方可能在 UI 线程上（确认框回调），若放任后续 await 捕获
+    /// UI 同步上下文，整个下载管线的续体都会被泵进 Dispatcher，UI 会被下载循环饿死（界面冻结）。
     /// </summary>
-    public async Task EnqueueAsync(InstallRequest request)
+    public Task EnqueueAsync(InstallRequest request) => Task.Run(() => EnqueueCoreAsync(request));
+
+    private async Task EnqueueCoreAsync(InstallRequest request)
     {
         var task = await AddTaskAsync(request);
         if (task is null) return;
+        using var linked = CancellationTokenSource.CreateLinkedTokenSource(_shutdown.Token, task.Cts.Token);
         try
         {
-            await _gate.WaitAsync(_shutdown.Token);
+            await _gate.WaitAsync(linked.Token);
         }
         catch (OperationCanceledException)
         {
-            task.Stage = DownloadTaskStage.Failed;
-            task.Message = "插件已停止";
+            FinishCancelled(task);
             _hostApi.InvokeOnMainThread(BumpActiveCount);
             return;
         }
         try
         {
-            await ProcessAsync(task);
+            await ProcessAsync(task, linked.Token);
         }
         finally
         {
             _gate.Release();
+        }
+    }
+
+    /// <summary>同一资源是否已有活动任务；遍历 Tasks，只能在主线程调用。</summary>
+    public bool HasActiveTask(string deduplicationKey)
+    {
+        foreach (var task in Tasks)
+            if (task.IsActive && task.Request.DeduplicationKey == deduplicationKey) return true;
+        return false;
+    }
+
+    /// <summary>把任务收尾为「已取消」或「插件已停止」：用户取消写入历史，插件停止不写。</summary>
+    private void FinishCancelled(DownloadTask task)
+    {
+        task.SpeedBytesPerSec = 0;
+        if (task.Cts.IsCancellationRequested && !_shutdown.IsCancellationRequested)
+        {
+            task.Stage = DownloadTaskStage.Cancelled;
+            task.Message = "已取消";
+            RecordHistory(task, DownloadRecord.OutcomeCancelled);
+        }
+        else
+        {
+            task.Stage = DownloadTaskStage.Failed;
+            task.Message = "插件已停止";
         }
     }
 
@@ -146,9 +181,8 @@ public class DownloadManager
         ActiveTaskCountChanged?.Invoke(count);
     }
 
-    private async Task ProcessAsync(DownloadTask task)
+    private async Task ProcessAsync(DownloadTask task, CancellationToken ct)
     {
-        var ct = _shutdown.Token;
         try
         {
             // 1. 下载目录：设置项，或系统盘 Galgame 文件夹（自动创建）。
@@ -233,9 +267,7 @@ public class DownloadManager
         }
         catch (OperationCanceledException) when (ct.IsCancellationRequested)
         {
-            task.Stage = DownloadTaskStage.Failed;
-            task.Message = "插件已停止";
-            task.SpeedBytesPerSec = 0;
+            FinishCancelled(task);
         }
         catch (Exception e)
         {

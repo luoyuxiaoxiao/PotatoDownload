@@ -163,6 +163,7 @@ public sealed class DownloadProgressDialog : UserControl
         DownloadTaskStage.Importing => "入库中",
         DownloadTaskStage.Completed => "已完成",
         DownloadTaskStage.Failed => "失败",
+        DownloadTaskStage.Cancelled => "已取消",
         _ => stage.ToString(),
     };
 
@@ -204,7 +205,9 @@ public sealed class DownloadProgressDialog : UserControl
     private static FrameworkElement CreateHistoryRow(DownloadRecord record)
     {
         var ok = record.Outcome == DownloadRecord.OutcomeCompleted;
-        var glyphBrush = PluginTheme.GetBrush(ok ? "SystemFillColorSuccessBrush" : "SystemFillColorCriticalBrush");
+        var cancelled = record.Outcome == DownloadRecord.OutcomeCancelled;
+        var glyphBrush = PluginTheme.GetBrush(ok ? "SystemFillColorSuccessBrush"
+            : cancelled ? "TextFillColorSecondaryBrush" : "SystemFillColorCriticalBrush");
 
         var grid = TwoColumnGrid();
         grid.Children.Add(Glyph(ok ? "" : "", glyphBrush));
@@ -220,7 +223,7 @@ public sealed class DownloadProgressDialog : UserControl
         {
             Text = ok
                 ? $"已完成 · {DownloadManager.FormatBytes(record.Size)}"
-                : $"失败：{record.Message}",
+                : cancelled ? "已取消" : $"失败：{record.Message}",
             FontSize = 12,
             Opacity = 0.65,
             TextWrapping = TextWrapping.Wrap,
@@ -247,6 +250,7 @@ public sealed class DownloadProgressDialog : UserControl
         private readonly TextBlock _rightText;
         private readonly TextBlock _messageText;
         private readonly ProgressBar _progressBar;
+        private readonly Button _cancelButton;
 
         public TaskRow(DownloadTask task)
         {
@@ -269,14 +273,34 @@ public sealed class DownloadProgressDialog : UserControl
             centerStack.Children.Add(_progressBar);
             grid.Children.Add(centerStack);
 
+            var rightStack = new StackPanel
+            {
+                Spacing = 6,
+                HorizontalAlignment = HorizontalAlignment.Right,
+                VerticalAlignment = VerticalAlignment.Top,
+            };
             _rightText = new TextBlock
             {
                 FontSize = 12,
-                VerticalAlignment = VerticalAlignment.Top,
                 TextAlignment = TextAlignment.Right,
             };
-            Grid.SetColumn(_rightText, 2);
-            grid.Children.Add(_rightText);
+            _cancelButton = new Button
+            {
+                Content = "取消",
+                FontSize = 12,
+                Padding = new Thickness(10, 2, 10, 2),
+                HorizontalAlignment = HorizontalAlignment.Right,
+            };
+            _cancelButton.Click += (_, _) =>
+            {
+                _task.Cancel();
+                _cancelButton.IsEnabled = false;
+                _cancelButton.Content = "取消中…";
+            };
+            rightStack.Children.Add(_rightText);
+            rightStack.Children.Add(_cancelButton);
+            Grid.SetColumn(rightStack, 2);
+            grid.Children.Add(rightStack);
 
             Content = Card(grid);
 
@@ -296,6 +320,7 @@ public sealed class DownloadProgressDialog : UserControl
             _rightText.Text = _task.Stage == DownloadTaskStage.Downloading && _task.Total > 0
                 ? $"{_task.ProgressPercent:F0}% · {DownloadManager.FormatBytes((long)_task.SpeedBytesPerSec)}/s"
                 : StageText(_task.Stage);
+            _cancelButton.Visibility = _task.IsActive ? Visibility.Visible : Visibility.Collapsed;
         }
     }
 }

@@ -138,6 +138,15 @@ namespace PotatoVN.App.PluginBase
         {
             while (_confirmQueue.TryDequeue(out var request))
             {
+                // 同一资源已在下载（用户重复点击同一链接，或激活被重复投递）：不再弹确认框，
+                // 直接亮出下载面板让用户看到正在进行中的任务。此处已在主线程，遍历 Tasks 安全。
+                if (DownloadManager.HasActiveTask(request.DeduplicationKey))
+                {
+                    _hostApi.Log(Microsoft.UI.Xaml.Controls.InfoBarSeverity.Warning,
+                        $"PotatoDownload: push ignored, download already active ({request.Title})");
+                    ShowDownloadDialog();
+                    continue;
+                }
                 var window = _hostApi.GetMainWindow();
                 if (window is null)
                 {

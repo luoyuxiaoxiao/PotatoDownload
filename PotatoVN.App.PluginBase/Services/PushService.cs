@@ -130,24 +130,34 @@ public class PushService
         }
     }
 
-    /// <summary>冷启动兜底轮询：初始激活参数长期有效；同一对象只尝试读取一次。</summary>
+    /// <summary>
+    /// 冷启动兜底轮询：初始激活参数长期有效，但 GetActivatedEventArgs 每次都可能返回新对象，
+    /// 引用去重不可靠——成功读到一次初始参数（或确认其已失效）即完成使命退出；
+    /// 继续轮询只会把同一次冷启动激活每隔一个去重窗口重复投递一遍（重复弹确认/弹面板）。
+    /// </summary>
     private async Task PollLoopAsync(CancellationToken ct)
     {
         while (!ct.IsCancellationRequested)
         {
+            var done = false;
             try
             {
                 var args = AppInstance.GetCurrent().GetActivatedEventArgs();
                 if (args is not null && !ReferenceEquals(args, _lastPollArgs))
                 {
                     _lastPollArgs = args;
-                    HandleActivation(args, "sdk");
+                    done = HandleActivation(args, "sdk");
                 }
             }
             catch (Exception e)
             {
                 _hostApi.Log(InfoBarSeverity.Informational,
                     $"PotatoDownload: poll GetActivatedEventArgs failed: {e.GetType().Name} 0x{e.HResult:X8}");
+            }
+            if (done)
+            {
+                _hostApi.Log(InfoBarSeverity.Informational, "PotatoDownload: activation poll fulfilled, stopped");
+                break;
             }
             try
             {
@@ -160,8 +170,12 @@ public class PushService
         }
     }
 
-    /// <summary>轮询通道的激活处理：失效 COM 代理是预期现象（热激活由事件通道负责）。</summary>
-    private void HandleActivation(AppActivationArguments args, string source)
+    /// <summary>
+    /// 轮询通道的激活处理：失效 COM 代理是预期现象（热激活由事件通道负责）。
+    /// 返回 true 表示轮询使命结束：初始参数已成功读取（无论是否 potato-vn），或其代理已失效
+    /// （该次激活已由事件通道处理）；此后的激活一律由事件通道送达。
+    /// </summary>
+    private bool HandleActivation(AppActivationArguments args, string source)
     {
         Uri? uri;
         try
@@ -174,22 +188,23 @@ public class PushService
             // 该次激活已由事件通道处理，此处静默跳过即可。
             _hostApi.Log(InfoBarSeverity.Informational,
                 $"PotatoDownload: stale activation args via {source} (0x{e.HResult:X8}), expected for warm activations");
-            return;
+            return true;
         }
         catch (Exception e)
         {
             _hostApi.Log(InfoBarSeverity.Warning,
                 $"PotatoDownload: read activation via {source} failed: {e.GetType().Name} 0x{e.HResult:X8} {e.Message}");
             ReportThrottled(e, $"PotatoDownload: read activation via {source} failed");
-            return;
+            return false;
         }
         if (uri is null)
         {
             _hostApi.Log(InfoBarSeverity.Informational,
                 $"PotatoDownload: activation has no potato-vn URI (via {source})");
-            return;
+            return true;
         }
         HandleUri(uri, source);
+        return true;
     }
 
     /// <summary>从激活参数中提取 URI（Protocol 直接取；Launch 解析 MSI/侧载的 /p 命令行参数）。</summary>
