@@ -113,6 +113,11 @@ namespace PotatoVN.App.PluginBase
             _ = _hostApi.SaveDataAsync(dataJson);
         }
 
+        /// <summary>默认下载目录：系统盘（一定存在）下的 Galgame 文件夹，使用时自动创建。</summary>
+        internal static string DefaultDownloadPath =>
+            System.IO.Path.Combine(
+                System.IO.Path.GetPathRoot(Environment.SystemDirectory) ?? @"C:\", "Galgame");
+
         /// <summary>下载历史集合（持久化在插件数据里，随宿主保存）。</summary>
         internal static System.Collections.ObjectModel.ObservableCollection<DownloadRecord> HistoryCollection =>
             PluginDataInstance.History;

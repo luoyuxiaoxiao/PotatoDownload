@@ -25,26 +25,15 @@ namespace PotatoVN.App.PluginBase.Controls
                 Margin = PluginTheme.GetThickness("SmallBottomMargin", new Thickness(0, 0, 0, 12)),
             };
 
-            root.Children.Add(CreatePanel(new StackPanel
-            {
-                Spacing = 10,
-                Padding = new Thickness(20),
-                Children =
-                {
-                    new TextBlock { FontSize = 24, Text = "PotatoDownload" },
-                    new TextBlock { Text = "从 shionlib 自动推送到 PotatoVN 进行下载、解压和刮削。" },
-                },
-            }));
-
             var pathBox = new TextBox
             {
                 Text = _data.DownloadPath,
-                PlaceholderText = @"例如 D:\Games",
+                PlaceholderText = @"留空则使用 C:\Galgame",
                 Width = 320,
             };
             pathBox.LostFocus += (_, _) => _data.DownloadPath = pathBox.Text;
             root.Children.Add(CreatePanel(new StdSetting("下载目录",
-                "解压后的游戏存放位置，留空则使用插件目录下的 downloads", pathBox)));
+                "解压后的游戏存放位置；留空则在系统盘创建 Galgame 文件夹使用", pathBox)));
 
             var autoSwitch = new ToggleSwitch { IsOn = _data.AutoDownload };
             autoSwitch.Toggled += (_, _) => _data.AutoDownload = autoSwitch.IsOn;

@@ -103,9 +103,9 @@ public class DownloadManager
             var library = new LibraryService(_hostApi);
             await library.EnsurePlaceholderAsync(task.Request);
 
-            // 2. 下载目录：设置项或插件目录下
+            // 2. 下载目录：设置项，或系统盘 Galgame 文件夹（自动创建）
             var downloadDir = string.IsNullOrWhiteSpace(Plugin.DownloadPath)
-                ? System.IO.Path.Combine(_hostApi.GetPluginPath(), "downloads")
+                ? Plugin.DefaultDownloadPath
                 : Plugin.DownloadPath;
             System.IO.Directory.CreateDirectory(downloadDir);
             var packPath = System.IO.Path.Combine(downloadDir, task.Request.FileName);
