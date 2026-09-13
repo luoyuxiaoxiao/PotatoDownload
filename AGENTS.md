@@ -96,6 +96,7 @@
 - **工作区可能被平台重置**（2026-09-13 实例：工作树被重置为 main 的 Initial commit，源文件全删，但 plan 分支的 git 对象幸存 → git checkout plan 一键全恢复；obj/Stamped 也可作最后退路）。教训：关键节点勤 push 到远程，不要只依赖本地提交
 - 公共 base64 echo 端点只有 `httpbingo.org/base64/{base64url}` 字节级可靠（2026-09 实测 sha256 完全一致）；httpbin.org 的 /base64 对含 `+`/`/` 的标准 base64 一律 404（百分号编码也不行）——构造测试下载地址别用 httpbin
 - **插件 UI 禁用 XAML，一律纯 C#**：插件 XAML 依赖宿主 v1.10.1+ 的 PluginXamlHost（注册插件 IXamlMetadataProvider + ms-appx 绝对路径 LoadComponent），旧宿主 CreateSettingUi 直接 XamlParseException（2026-09 用户实测崩溃）；不要调用 ResourceLoader.Initialize/加载 Styles 字典；C# 取主题资源用 PluginTheme（ResourceDictionary.TryGetValue 不进 ThemeDictionaries，需递归且必须带回退值）
+- **pull 真分歧冲突的解法（2026-09-14 实证，a953359）**：平台会话与本地会话并行向 main 提交同一功能的两套实现（本地 6bce3c1 暂停/继续+心跳 vs 远端 3b228e3+2d112e7 完整重写）时，先 `git show :1/:2/:3` 抽三阶段对比——远端重写版通常是本地工作的严格超集（心跳/图标按钮/暂停继续都已含更完善形态），确认后整个冲突文件取 theirs，别逐 hunk 手拼；验收标准：`git diff origin/main --stat` 为空（合并树与远端逐字节一致、本地无遗失），CoreChecks + build_plugin 全绿再提交
 
 ### References
 <!-- 外部资源指针。例：- 报错日志查 Grafana: grafana.internal/d/plugin-runtime -->
