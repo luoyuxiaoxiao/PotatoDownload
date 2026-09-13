@@ -17,18 +17,20 @@ namespace PotatoVN.App.PluginBase.Controls;
 public sealed class DownloadProgressDialog : UserControl
 {
     private const string GlyphFont = "Segoe MDL2 Assets";
+    private const int HistoryCollapsedCount = 5; // 历史记录默认展示条数，超出需点击展开
 
     private readonly StackPanel _activePanel;
     private readonly StackPanel _historyPanel;
-    private readonly TextBlock _activeHeader;
-    private readonly TextBlock _historyHeader;
+    private readonly FrameworkElement _activeHeader;
+    private readonly FrameworkElement _historyHeader;
     private readonly TextBlock _emptyText;
+    private bool _historyExpanded;
 
     public DownloadProgressDialog()
     {
         _activeHeader = CreateHeader("进行中");
         _activePanel = new StackPanel { Spacing = 10 };
-        _historyHeader = CreateHeader("历史记录");
+        _historyHeader = CreateHistoryHeader();
         _historyPanel = new StackPanel { Spacing = 10 };
         _emptyText = new TextBlock
         {
@@ -73,7 +75,32 @@ public sealed class DownloadProgressDialog : UserControl
         FontSize = 13,
         Margin = new Thickness(0, 4, 0, 0),
         Opacity = 0.8,
+        VerticalAlignment = VerticalAlignment.Center,
     };
+
+    private FrameworkElement CreateHistoryHeader()
+    {
+        var grid = new Grid();
+        grid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+        grid.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+        grid.Children.Add(CreateHeader("历史记录"));
+        var clearButton = new Button
+        {
+            Content = "清空历史",
+            FontSize = 12,
+            Padding = new Thickness(10, 2, 10, 2),
+            VerticalAlignment = VerticalAlignment.Center,
+        };
+        clearButton.Click += (_, _) =>
+        {
+            Plugin.HistoryCollection.Clear();
+            Plugin.SaveDataNow();
+            Rebuild();
+        };
+        Grid.SetColumn(clearButton, 1);
+        grid.Children.Add(clearButton);
+        return grid;
+    }
 
     private void OnCollectionChanged(object? sender, NotifyCollectionChangedEventArgs e) =>
         Plugin.HostApi.InvokeOnMainThread(Rebuild);
@@ -98,15 +125,33 @@ public sealed class DownloadProgressDialog : UserControl
         _activeHeader.Visibility = activeCount > 0 ? Visibility.Visible : Visibility.Collapsed;
 
         _historyPanel.Children.Clear();
-        var historyCount = 0;
-        foreach (var record in Plugin.HistoryCollection)
+        var history = Plugin.HistoryCollection;
+        var shown = 0;
+        foreach (var record in history)
         {
+            if (!_historyExpanded && shown >= HistoryCollapsedCount) break;
             _historyPanel.Children.Add(CreateHistoryRow(record));
-            historyCount++;
+            shown++;
         }
-        _historyHeader.Visibility = historyCount > 0 ? Visibility.Visible : Visibility.Collapsed;
+        _historyHeader.Visibility = history.Count > 0 ? Visibility.Visible : Visibility.Collapsed;
+        if (history.Count > HistoryCollapsedCount)
+        {
+            var expandButton = new Button
+            {
+                HorizontalAlignment = HorizontalAlignment.Stretch,
+                Content = _historyExpanded
+                    ? $"收起 {(char)0x25B2}"
+                    : $"展开全部（共 {history.Count} 条）{(char)0x25BC}",
+            };
+            expandButton.Click += (_, _) =>
+            {
+                _historyExpanded = !_historyExpanded;
+                Rebuild();
+            };
+            _historyPanel.Children.Add(expandButton);
+        }
 
-        _emptyText.Visibility = activeCount + historyCount == 0 ? Visibility.Visible : Visibility.Collapsed;
+        _emptyText.Visibility = activeCount + history.Count == 0 ? Visibility.Visible : Visibility.Collapsed;
     }
 
     private static string StageText(DownloadTaskStage stage) => stage switch

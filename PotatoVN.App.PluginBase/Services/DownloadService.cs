@@ -13,13 +13,13 @@ namespace PotatoVN.App.PluginBase.Services;
 
 /// <summary>
 /// 下载服务：多线程分块下载 + 断点续传。
-/// 支持 Range 请求的服务器会分块并行下载；不支持时自动退化为单连接顺序下载。
-/// 断点续传通过 .part 文件 + 水位记录实现，中断后再次下载会从已提交字节继续。
+/// 支持 Range 的服务器分块并发下载；不支持时自动退化为单连接顺序下载。
+/// 断点续传通过 .part 文件 + 水位记录实现，中断后再次下载会从未提交字节继续。
 /// </summary>
 public class DownloadService
 {
     private const int ChunkSize = 4 * 1024 * 1024; // 每块 4MB
-    private const int MaxConnections = 4;          // 最大并行连接数
+    private const int MaxConnections = 4;          // 分块并发连接数
     private const int MaxRetries = 3;              // 单块失败重试次数
     private const int BufferSize = 81920;
 
@@ -37,39 +37,58 @@ public class DownloadService
     /// <summary>
     /// 下载文件到目标路径（支持断点续传与多线程分块）。
     /// </summary>
-    /// <param name="request">推送请求（含 URL、期望大小、校验值）</param>
-    /// <param name="targetPath">下载文件保存路径（最终产物）</param>
+    /// <param name="request">安装请求（含 URL、预期大小、校验值）</param>
+    /// <param name="targetPath">最终文件存放路径（下载完成即挪到此处）</param>
     /// <param name="onProgress">进度回调 (已提交字节, 总字节)</param>
     /// <param name="ct">取消令牌</param>
     public async Task DownloadAsync(InstallRequest request, string targetPath,
         Action<long, long>? onProgress = null, CancellationToken ct = default)
     {
         if (request.IsExpired(DateTimeOffset.Now))
-            throw new DownloadException("下载直链已过期，请重新从资源提供方推送任务");
+            throw new DownloadException("下载直链已过期，请重新从来源提供方获取链接");
 
         var partPath = targetPath + ".part";
         var watermarkPath = targetPath + ".part.watermark";
+        var totalBytes = (long)request.Size;
 
-        // 探测服务器是否支持 Range
-        var rangeSupported = await ProbeRangeAsync(request.Url, ct);
-
-        if (rangeSupported)
+        if (IsAlreadyComplete(partPath, watermarkPath, totalBytes))
         {
-            await DownloadChunkedAsync(request, partPath, watermarkPath, onProgress, ct);
+            // 上次留下了完整的 .part（例如在校验/后续步骤失败中断）——直接复用，跳过下载
+            onProgress?.Invoke(totalBytes, totalBytes);
         }
         else
         {
-            await DownloadSequentialAsync(request, partPath, watermarkPath, onProgress, ct);
+            // 探测服务器是否支持 Range
+            var rangeSupported = await ProbeRangeAsync(request.Url, ct);
+            if (rangeSupported)
+                await DownloadChunkedAsync(request, partPath, watermarkPath, onProgress, ct);
+            else
+                await DownloadSequentialAsync(request, partPath, watermarkPath, onProgress, ct);
         }
 
-        // 校验并落盘为最终文件
+        // 校验并挪为最终文件
         await VerifyChecksumAsync(request, partPath, ct);
         if (File.Exists(targetPath)) File.Delete(targetPath);
         File.Move(partPath, targetPath);
         TryDelete(watermarkPath);
     }
 
-    /// <summary>探测服务器是否支持 HTTP Range（发一个小 Range 请求，206 即支持）。</summary>
+    /// <summary>上次的 .part 已完整（水位与文件大小都达到预期值）。</summary>
+    private static bool IsAlreadyComplete(string partPath, string watermarkPath, long totalBytes)
+    {
+        try
+        {
+            return File.Exists(partPath) &&
+                   new FileInfo(partPath).Length == totalBytes &&
+                   ReadWatermark(watermarkPath, totalBytes) >= totalBytes;
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    /// <summary>探测服务器是否支持 HTTP Range（发一个小 Range 请求看是否回 206）。</summary>
     private async Task<bool> ProbeRangeAsync(string url, CancellationToken ct)
     {
         try
@@ -85,7 +104,7 @@ public class DownloadService
         }
     }
 
-    /// <summary>多线程分块下载：每块独立连接，Range 请求，写入文件对应偏移。</summary>
+    /// <summary>多线程分块下载：每个连接认领块，按 Range 写入文件对应偏移。</summary>
     private async Task DownloadChunkedAsync(InstallRequest request, string partPath,
         string watermarkPath, Action<long, long>? onProgress, CancellationToken ct)
     {
@@ -101,7 +120,7 @@ public class DownloadService
             if (chunkStart < committed) completedChunks[i] = true;
         }
 
-        // 打开文件句柄（共享写，各块线程可并发写不同偏移）
+        // 文件预分配完整大小，方便各线程乱序写不同偏移
         await using var fileStream = new FileStream(partPath, FileMode.OpenOrCreate, FileAccess.Write,
             FileShare.ReadWrite, BufferSize, true);
         fileStream.SetLength(totalBytes);
@@ -163,7 +182,7 @@ public class DownloadService
         }
     }
 
-    /// <summary>单连接顺序下载（服务器不支持 Range 时的回退方案）。</summary>
+    /// <summary>单连接顺序下载：服务器不支持 Range 时的退化方案（可断点续传）。</summary>
     private async Task DownloadSequentialAsync(InstallRequest request, string partPath,
         string watermarkPath, Action<long, long>? onProgress, CancellationToken ct)
     {
@@ -177,9 +196,19 @@ public class DownloadService
             HttpCompletionOption.ResponseHeadersRead, ct);
         response.EnsureSuccessStatusCode();
 
+        if (committed > 0 && response.StatusCode != System.Net.HttpStatusCode.PartialContent)
+        {
+            // 服务端忽略了 Range（整包返回）——必须从头覆盖写入，否则会在已有数据后继续追加
+            // （2026-09 实测：上次校验失败留下的完整 .part + 水位，续传时整包追加导致 2 倍大小）
+            committed = 0;
+            SaveWatermark(watermarkPath, 0);
+        }
+
         await using var contentStream = await response.Content.ReadAsStreamAsync(ct);
         await using var fileStream = new FileStream(partPath, FileMode.OpenOrCreate, FileAccess.Write,
             FileShare.None, BufferSize, true);
+        // 截掉水位之后的脏数据（防御 .part 比水位记录更长的情况）
+        if (fileStream.Length > committed) fileStream.SetLength(committed);
         fileStream.Seek(committed, SeekOrigin.Begin);
 
         var buffer = new byte[BufferSize];
@@ -219,7 +248,7 @@ public class DownloadService
         }
         catch
         {
-            // 水位写入失败不阻塞下载
+            // 水位写失败不影响下载
         }
     }
 
@@ -236,7 +265,7 @@ public class DownloadService
     }
 
     /// <summary>
-    /// 校验文件哈希（SHA-256 或 BLAKE3）。未提供校验值时跳过。
+    /// 校验文件哈希（SHA-256 或 BLAKE3）。未提供校验值时直接通过。
     /// </summary>
     public static async Task VerifyChecksumAsync(InstallRequest request, string filePath,
         CancellationToken ct = default)

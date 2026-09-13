@@ -1,4 +1,6 @@
-﻿using System.Threading.Tasks;
+﻿using System;
+using System.Collections.Generic;
+using System.Threading.Tasks;
 using GalgameManager.Models;
 using GalgameManager.WinApp.Base.Contracts.PluginUi;
 using GalgameManager.WinApp.Base.Models.Plugin;
@@ -11,6 +13,43 @@ namespace PotatoVN.App.PluginBase;
 public partial class Plugin : IGalgamePageLeftPanel, IGalgamePageRightPanel
 {
     private bool _uiInit;
+
+    // ===== 对话框串行协调器 =====
+    // ContentDialog 同一时刻只能显示一个；推送确认框/下载面板/测试面板可能同时被触发，
+    // 全部经此队列串行弹出，避免 ShowAsync 抛异常导致请求被静默吞掉。
+    private readonly Queue<Func<Task>> _dialogQueue = new();
+    private bool _dialogShowing;
+
+    private void EnqueueDialog(Func<Task> showAsync)
+    {
+        _dialogQueue.Enqueue(showAsync);
+        _hostApi.InvokeOnMainThread(() => _ = PumpDialogQueueAsync());
+    }
+
+    private async Task PumpDialogQueueAsync()
+    {
+        if (_dialogShowing) return;
+        _dialogShowing = true;
+        try
+        {
+            while (_dialogQueue.Count > 0)
+            {
+                var showAsync = _dialogQueue.Dequeue();
+                try
+                {
+                    await showAsync();
+                }
+                catch (Exception e)
+                {
+                    _ = DevReportInfo(e, "EnqueueDialog show failed");
+                }
+            }
+        }
+        finally
+        {
+            _dialogShowing = false;
+        }
+    }
     
     private void InitUi()
     {
@@ -62,15 +101,15 @@ public partial class Plugin : IGalgamePageLeftPanel, IGalgamePageRightPanel
         });
     }
 
-    /// <summary>弹出推送测试面板（模态）。</summary>
+    /// <summary>弹出推送测试面板（模态，经串行协调器）。</summary>
     private void ShowTestPushDialog()
     {
         _hostApi.InvokeOnMainThread(() =>
         {
-            try
+            var window = _hostApi.GetMainWindow();
+            if (window is null) return;
+            EnqueueDialog(async () =>
             {
-                var window = _hostApi.GetMainWindow();
-                if (window is null) return;
                 var dialog = new ContentDialog
                 {
                     XamlRoot = window.Content.XamlRoot,
@@ -79,44 +118,41 @@ public partial class Plugin : IGalgamePageLeftPanel, IGalgamePageRightPanel
                     CloseButtonText = "关闭",
                     DefaultButton = ContentDialogButton.Close,
                 };
-                _ = dialog.ShowAsync();
-            }
-            catch (System.Exception e)
-            {
-                _ = DevReportInfo(e, "ShowTestPushDialog failed");
-            }
+                await dialog.ShowAsync();
+            });
         });
     }
 
     private bool _downloadDialogOpen;
 
-    /// <summary>弹出下载进度弹窗（模态；已打开时不重复弹出）。</summary>
+    /// <summary>弹出下载进度弹窗（模态，经串行协调器；已打开时不重复弹出）。</summary>
     private void ShowDownloadDialog()
     {
         _hostApi.InvokeOnMainThread(() =>
         {
-            try
+            if (_downloadDialogOpen) return;
+            var window = _hostApi.GetMainWindow();
+            if (window is null) return;
+            _downloadDialogOpen = true;
+            EnqueueDialog(async () =>
             {
-                if (_downloadDialogOpen) return;
-                var window = _hostApi.GetMainWindow();
-                if (window is null) return;
-                _downloadDialogOpen = true;
-                var dialog = new ContentDialog
+                try
                 {
-                    XamlRoot = window.Content.XamlRoot,
-                    Title = "下载",
-                    Content = new DownloadProgressDialog(),
-                    CloseButtonText = "关闭",
-                    DefaultButton = ContentDialogButton.Close,
-                };
-                dialog.Closed += (_, _) => _downloadDialogOpen = false;
-                _ = dialog.ShowAsync();
-            }
-            catch (System.Exception e)
-            {
-                _downloadDialogOpen = false;
-                _ = DevReportInfo(e, "ShowDownloadDialog failed");
-            }
+                    var dialog = new ContentDialog
+                    {
+                        XamlRoot = window.Content.XamlRoot,
+                        Title = "下载",
+                        Content = new DownloadProgressDialog(),
+                        CloseButtonText = "关闭",
+                        DefaultButton = ContentDialogButton.Close,
+                    };
+                    await dialog.ShowAsync();
+                }
+                finally
+                {
+                    _downloadDialogOpen = false;
+                }
+            });
         });
     }
 
