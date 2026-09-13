@@ -63,7 +63,8 @@
 - 参考实现：ReinaManager `src-tauri/src/install/`（protocol/download/workflow），Shionlib `apps/frontend/components/game/download/helpers/reina.ts`
 - 下载架构：DownloadService 多线程分块（4 连接 × 4MB 块，Range 探测失败退化为单连接续传），.part + .part.watermark 断点续传；DownloadManager 串行队列 + ObservableCollection<DownloadTask> 供 UI 绑定
 - UI：侧边栏按钮"下载"→ ContentDialog 弹窗（DownloadProgressDialog，纯C#，Chrome 风格：进行中+历史记录两区，速度 EMA 平滑 + 500ms 限流），无独立页面；设置页 UserControl1（纯C#）；主题资源查找走 Helper/PluginTheme
-- 交互语义：自动下载 ON=立即下载并自动弹下载面板；OFF=弹"确认下载"ContentDialog（ContentDialog 同时只能开一个，用 FIFO 队列串行）；推送到达自动弹面板是**宿主 DefaultActivationHandler 导航不可抑制**的替代方案（插件 API 无法阻止跳起始页）
+- 交互语义：自动下载 ON=立即下载并自动弹下载面板；OFF=弹"确认下载"ContentDialog；**全部弹窗（确认/下载面板/测试面板）经 Plugin_Ui 的 EnqueueDialog 串行协调器**——ContentDialog 同时只能开一个，各自 ShowAsync 会撞车静默吞请求（2026-09 远程报错实证）；推送到达自动弹面板是**宿主 DefaultActivationHandler 导航不可抑制**的替代方案（插件 API 无法阻止跳起始页）
+- 断点续传坑：.part+水位在失败中断后会残留；DownloadAsync 开头对"水位与文件大小都达预期"的 .part 直接复用跳过下载；DownloadSequentialAsync 里 committed>0 但响应不是 206（服务端忽略 Range 整包返回）必须清零从头覆盖，否则重复追加成 2 倍大小（2026-09 实测 363→726）
 - 下载历史持久化在 PluginData.History（get-only ObservableCollection，STJ 可 populate；集合变更不触发 PropertyChanged，需 Plugin.SaveDataNow() 手动保存）；侧边栏按钮状态切换靠 Unregister+Register（宿主无原地更新接口）
 - DevReportInfo 已在 Plugin.cs 实现（上传到应用市场/正式版前必须改为空实现）
 - 测验平台：repo/TestPlatform/index.html（file:// 直开；E2E/过期/坏校验/SSRF/缺参/确认下载预设 + 自定义构造器 + 发送历史）；载荷 payload/test_game.zip（363B，含 CLANNAD/ 顶层目录，改内容后跑 make-payload.ps1 并更新页面 PAYLOAD 常量）；宿主侧安装入口：插件页"从本地压缩包安装"（AddPluginFromLocalZip），可直接选 artifacts/plugin.pvnplugin.zip
