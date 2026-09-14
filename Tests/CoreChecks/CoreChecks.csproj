@@ -12,9 +12,14 @@
   <ItemGroup>
     <Compile Include="../../PotatoVN.App.PluginBase/Models/InstallRequest.cs" Link="Plugin/InstallRequest.cs" />
     <Compile Include="../../PotatoVN.App.PluginBase/Models/DownloadRecord.cs" Link="Plugin/DownloadRecord.cs" />
+    <Compile Include="../../PotatoVN.App.PluginBase/Models/UnpackProgress.cs" Link="Plugin/UnpackProgress.cs" />
+    <Compile Include="../../PotatoVN.App.PluginBase/Helper/TransferProgressDisplay.cs" Link="Plugin/TransferProgressDisplay.cs" />
     <Compile Include="../../PotatoVN.App.PluginBase/Services/DownloadService.cs" Link="Plugin/DownloadService.cs" />
     <Compile Include="../../PotatoVN.App.PluginBase/Services/DownloadManager.cs" Link="Plugin/DownloadManager.cs" />
     <Compile Include="../../PotatoVN.App.PluginBase/Services/UnpackService.cs" Link="Plugin/UnpackService.cs" />
+    <Compile Include="../../PotatoVN.App.PluginBase/Services/SevenZipNative.cs" Link="Plugin/SevenZipNative.cs" />
+    <Compile Include="../../PotatoVN.App.PluginBase/Services/SevenZipUnpacker.cs" Link="Plugin/SevenZipUnpacker.cs" />
+    <None Include="../../PotatoVN.App.PluginBase/Native/7zip/**/*" Link="Native/7zip/%(RecursiveDir)%(Filename)%(Extension)" CopyToOutputDirectory="PreserveNewest" />
   </ItemGroup>
   <ItemGroup>
     <PackageReference Include="Blake3.Managed" Version="1.5.2" />

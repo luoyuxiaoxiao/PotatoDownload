@@ -1,5 +1,7 @@
 using System;
+using System.Collections.Generic;
 using System.Collections.Specialized;
+using System.Diagnostics;
 using Microsoft.UI.Text;
 using Microsoft.UI.Xaml;
 using Microsoft.UI.Xaml.Controls;
@@ -138,12 +140,18 @@ public sealed class DownloadProgressDialog : UserControl
 
     private void Rebuild()
     {
+        // 历史更新或新推送不应把正在下载的行重新实例化，否则速率采样会被清空，显示突然归零。
+        var existingRows = new Dictionary<DownloadTask, TaskRow>();
+        foreach (var child in _activePanel.Children)
+            if (child is TaskRow row) existingRows[row.Task] = row;
         _activePanel.Children.Clear();
         var activeCount = 0;
         foreach (var task in Plugin.DownloadManager.Tasks)
         {
             if (!task.IsListed) continue;
-            _activePanel.Children.Add(new TaskRow(task));
+            var row = existingRows.TryGetValue(task, out var existing) ? existing : new TaskRow(task);
+            _activePanel.Children.Add(row);
+            row.Refresh();
             activeCount++;
         }
         _activeHeader.Visibility = activeCount > 0 ? Visibility.Visible : Visibility.Collapsed;
@@ -235,7 +243,7 @@ public sealed class DownloadProgressDialog : UserControl
             : cancelled ? "TextFillColorSecondaryBrush" : "SystemFillColorCriticalBrush");
 
         var grid = TwoColumnGrid();
-        grid.Children.Add(Glyph(ok ? "" : "", glyphBrush));
+        grid.Children.Add(Glyph(ok ? "\uE73E" : cancelled ? "\uE711" : "\uEA39", glyphBrush));
 
         var textStack = new StackPanel { Spacing = 2, Margin = new Thickness(10, 0, 10, 0) };
         Grid.SetColumn(textStack, 1);
@@ -268,19 +276,23 @@ public sealed class DownloadProgressDialog : UserControl
         return Card(grid);
     }
 
-    /// <summary>活动任务行：图标 + 标题/状态 + 进度条 + 速度/完成度 + 暂停/继续/取消。速度 = 每次刷新的字节增量做 EMA 平滑。</summary>
+    /// <summary>活动任务行：按当前阶段展示真实字节进度；速度使用三秒滑窗，未知总量时使用不定进度条。</summary>
     private sealed class TaskRow : UserControl
     {
         private readonly DownloadTask _task;
         private readonly TextBlock _rightText;
+        private readonly TextBlock _speedText;
         private readonly TextBlock _messageText;
+        private readonly TextBlock _detailText;
         private readonly ProgressBar _progressBar;
         private readonly Button _pauseButton;
         private readonly Button _resumeButton;
         private readonly Button _cancelButton;
-        private long _lastBytes;
-        private DateTimeOffset _lastTick;
-        private double _speed;
+        private readonly Stopwatch _clock = Stopwatch.StartNew();
+        private readonly TransferSpeedSampler _speed = new();
+        private DownloadTaskStage? _sampleStage;
+
+        internal DownloadTask Task => _task;
 
         /// <summary>Chrome 下载行风格的小图标按钮。</summary>
         private static Button IconButton(Symbol symbol, string tooltip)
@@ -300,11 +312,9 @@ public sealed class DownloadProgressDialog : UserControl
         public TaskRow(DownloadTask task)
         {
             _task = task;
-            _lastBytes = task.Received;
-            _lastTick = DateTimeOffset.UtcNow;
 
             var grid = TwoColumnGrid();
-            grid.Children.Add(Glyph(""));
+            grid.Children.Add(Glyph("\uE896"));
 
             var centerStack = new StackPanel { Spacing = 2, Margin = new Thickness(10, 0, 10, 0) };
             Grid.SetColumn(centerStack, 1);
@@ -316,6 +326,14 @@ public sealed class DownloadProgressDialog : UserControl
             });
             _messageText = new TextBlock { FontSize = 12, Opacity = 0.65, TextWrapping = TextWrapping.Wrap };
             centerStack.Children.Add(_messageText);
+            _detailText = new TextBlock
+            {
+                FontSize = 11,
+                Opacity = 0.55,
+                TextTrimming = TextTrimming.CharacterEllipsis,
+                Visibility = Visibility.Collapsed,
+            };
+            centerStack.Children.Add(_detailText);
             _progressBar = new ProgressBar { Height = 4, Maximum = 100, Margin = new Thickness(0, 4, 0, 0) };
             centerStack.Children.Add(_progressBar);
             grid.Children.Add(centerStack);
@@ -323,12 +341,19 @@ public sealed class DownloadProgressDialog : UserControl
             var rightStack = new StackPanel
             {
                 Spacing = 6,
+                MinWidth = 116,
                 HorizontalAlignment = HorizontalAlignment.Right,
                 VerticalAlignment = VerticalAlignment.Top,
             };
             _rightText = new TextBlock
             {
                 FontSize = 12,
+                TextAlignment = TextAlignment.Right,
+            };
+            _speedText = new TextBlock
+            {
+                FontSize = 11,
+                Opacity = 0.65,
                 TextAlignment = TextAlignment.Right,
             };
             _pauseButton = IconButton(Symbol.Pause, "暂停");
@@ -359,6 +384,7 @@ public sealed class DownloadProgressDialog : UserControl
             buttonStack.Children.Add(_resumeButton);
             buttonStack.Children.Add(_cancelButton);
             rightStack.Children.Add(_rightText);
+            rightStack.Children.Add(_speedText);
             rightStack.Children.Add(buttonStack);
             Grid.SetColumn(rightStack, 2);
             grid.Children.Add(rightStack);
@@ -371,37 +397,91 @@ public sealed class DownloadProgressDialog : UserControl
         {
             var stage = _task.Stage;
             var received = _task.Received;
-            var downloading = stage == DownloadTaskStage.Downloading;
-            var now = DateTimeOffset.UtcNow;
-            var seconds = (now - _lastTick).TotalSeconds;
-            if (!downloading)
+            var unpack = _task.UnpackProgress;
+            if (_sampleStage != stage)
             {
-                _speed = 0;
+                _speed.Reset();
+                _sampleStage = stage;
             }
-            else if (seconds >= 0.25)
+            if (stage == DownloadTaskStage.Downloading)
+                _speed.Update(received, _clock.Elapsed);
+            else if (stage == DownloadTaskStage.Unpacking && unpack is not null)
+                _speed.Update(unpack.BytesExtracted, _clock.Elapsed);
+
+            var percent = 0.0;
+            var indeterminate = false;
+            var showProgress = stage != DownloadTaskStage.Pending;
+            var message = _task.Message;
+            var right = StageText(stage);
+            var rate = string.Empty;
+            var detail = string.Empty;
+            switch (stage)
             {
-                // 每次刷新的增量算瞬时速度再 EMA 平滑；增量为 0 时速度自然衰减，停滞一眼可见。重试导致的回退按 0 计
-                var instant = Math.Max(0, received - _lastBytes) / seconds;
-                _speed = _speed <= 0 ? instant : _speed * 0.7 + instant * 0.3;
+                case DownloadTaskStage.Downloading:
+                    percent = TransferProgressDisplay.Percent(received, _task.Total);
+                    message = $"下载中 · {DownloadManager.FormatBytes(received)} / {DownloadManager.FormatBytes(_task.Total)}";
+                    right = $"{percent:F1}%";
+                    rate = received >= _task.Total ? "正在收尾…" : SpeedText("等待数据…");
+                    break;
+                case DownloadTaskStage.Unpacking:
+                    // 不再把下载完成的 100% 进度条留到解压阶段；大文件内每次写入也会更新字节快照。
+                    indeterminate = unpack?.TotalBytes is not > 0;
+                    if (unpack is null) break;
+                    if (unpack.TotalBytes is > 0)
+                    {
+                        percent = TransferProgressDisplay.Percent(unpack.BytesExtracted, unpack.TotalBytes.Value);
+                        message = $"解压中 · {DownloadManager.FormatBytes(unpack.BytesExtracted)} / {DownloadManager.FormatBytes(unpack.TotalBytes.Value)}";
+                        right = $"{percent:F1}%";
+                    }
+                    else
+                    {
+                        message = $"解压中 · 已解压 {DownloadManager.FormatBytes(unpack.BytesExtracted)} · {unpack.FilesExtracted} 个文件";
+                    }
+                    detail = unpack.CurrentEntry ?? string.Empty;
+                    rate = unpack.TotalBytes is > 0 && unpack.BytesExtracted >= unpack.TotalBytes.Value
+                        ? "正在收尾…" : SpeedText("处理中…");
+                    break;
+                case DownloadTaskStage.Verifying:
+                case DownloadTaskStage.Importing:
+                    // 校验和刮削没有可用总量，展示当前动作，不能用下载字节数冒充整体完成度。
+                    indeterminate = true;
+                    break;
+                case DownloadTaskStage.Paused:
+                    if (_task.PausedFromStage == DownloadTaskStage.Downloading)
+                        percent = TransferProgressDisplay.Percent(received, _task.Total);
+                    else if (_task.PausedFromStage == DownloadTaskStage.Unpacking && unpack?.TotalBytes is > 0)
+                        percent = TransferProgressDisplay.Percent(unpack.BytesExtracted, unpack.TotalBytes.Value);
+                    else
+                        showProgress = false;
+                    break;
+                case DownloadTaskStage.Completed:
+                    percent = 100;
+                    break;
             }
-            _lastBytes = received;
-            _lastTick = now;
 
             // 已请求但流程尚未收尾：按钮立即反馈，不等下一轮
             var interrupting = _task.CancelRequest != CancelRequestKind.None && _task.IsActive;
             _messageText.Text = interrupting
                 ? (_task.CancelRequest == CancelRequestKind.Cancel ? "取消中…" : "暂停中…")
-                : downloading
-                    ? $"下载中 {DownloadManager.FormatBytes(received)} / {DownloadManager.FormatBytes(_task.Total)}"
-                    : _task.Message;
-            _progressBar.Value = _task.ProgressPercent;
-            _rightText.Text = downloading && _task.Total > 0
-                ? $"{_task.ProgressPercent:F0}% · {DownloadManager.FormatBytes((long)_speed)}/s"
-                : StageText(stage);
+                : message;
+            _progressBar.IsIndeterminate = indeterminate && !interrupting;
+            _progressBar.Value = percent;
+            _progressBar.Visibility = showProgress ? Visibility.Visible : Visibility.Collapsed;
+            _rightText.Text = right;
+            _speedText.Text = interrupting ? string.Empty : rate;
+            _speedText.Visibility = _speedText.Text.Length == 0 ? Visibility.Collapsed : Visibility.Visible;
+            _detailText.Text = detail;
+            _detailText.Visibility = detail.Length == 0 ? Visibility.Collapsed : Visibility.Visible;
+            ToolTipService.SetToolTip(_detailText, detail);
             _pauseButton.Visibility = _task.IsActive && !interrupting ? Visibility.Visible : Visibility.Collapsed;
             _resumeButton.Visibility = stage == DownloadTaskStage.Paused ? Visibility.Visible : Visibility.Collapsed;
             _cancelButton.Visibility = _task.IsListed && _task.CancelRequest != CancelRequestKind.Cancel
                 ? Visibility.Visible : Visibility.Collapsed;
         }
+
+        private string SpeedText(string waiting) => _speed.IsWaiting ? waiting
+            : _speed.BytesPerSecond is { } speed && speed > 0
+                ? $"{DownloadManager.FormatBytes((long)speed)}/s"
+                : "计算速度中…";
     }
 }

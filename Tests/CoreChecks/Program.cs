@@ -32,8 +32,11 @@ internal static class Program
         try
         {
             CheckValidation();
+            ProgressDisplayChecks.Run(Check);
             await CheckDownloadsAsync();
+            await DownloadTuningChecks.RunAsync(Root, Check);
             await CheckUnpackAsync();
+            await UnpackProgressChecks.RunAsync(Root, Check);
             await CheckManagerAsync();
         }
         finally
@@ -83,7 +86,8 @@ internal static class Program
         ulong size = 1234, string title = "CLANNAD", string? algo = null, string? checksum = null,
         string? password = null) => new()
     {
-        V = 1, Provider = "shionlib", ResourceId = "1", Url = url, FileName = fileName, ArchiveFormat = "7z",
+        V = 1, Provider = "shionlib", ResourceId = "1", Url = url, FileName = fileName,
+        ArchiveFormat = fileName.EndsWith(".zip", StringComparison.OrdinalIgnoreCase) ? "zip" : "7z",
         Size = size, BgmId = "13", Title = title, ChecksumAlgo = algo, Checksum = checksum, ArchivePassword = password,
     };
 
@@ -302,12 +306,12 @@ internal static class Program
         Directory.CreateDirectory(dir);
         var req = Req(fileName: "g.zip");
 
-        // zip-slip 条目由 SharpCompress 拒绝，不会写到目标目录之外
+        // 所有引擎共用的安全输出层拒绝 zip-slip，不会写到目标目录之外。
         var slip = Path.Combine(dir, "slip.zip");
         MakeZip(slip, ("ok/a.txt", "a"), ("../evil.txt", "evil"));
         var slipTarget = UnpackService.PrepareGameDirectory(dir, "slip-target");
         var eSlip = await Throws(() => UnpackService.UnpackAsync(req, slip, slipTarget));
-        Check(eSlip is not null && eSlip.Message.Contains("outside of the destination") && !File.Exists(Path.Combine(dir, "evil.txt")),
+        Check(eSlip is InvalidDataException && !File.Exists(Path.Combine(dir, "evil.txt")),
             $"unpack: zip-slip entry rejected by the destination check ({eSlip?.Message})");
 
         // 游戏目录名解析
@@ -488,6 +492,9 @@ internal static class Program
         var t1 = manager.Tasks[0];
         Check(t1.Stage == DownloadTaskStage.Completed && t1.Received == t1.Total && host.Errors == 0,
             $"manager: full pipeline completes ({t1.Stage}: {t1.Message})");
+        Check(t1.UnpackProgress is { FilesExtracted: 2 } unpack && unpack.BytesExtracted == content.Length + 3 &&
+              unpack.TotalBytes == unpack.BytesExtracted && t1.ProgressPercent == 100,
+            "manager: completed pipeline publishes final extraction bytes and completion percentage");
         // 游戏目录名取自压缩包唯一顶层文件夹（Game），包内结构原样解到该目录下：downloads/Game/Game/game.exe
         Check(File.Exists(Path.Combine(downloadDir, "Game", "Game", "game.exe"))
               && !File.Exists(Path.Combine(downloadDir, "Game", UnpackService.IncompleteMarker)), "manager: game extracted and marked complete");
@@ -510,7 +517,8 @@ internal static class Program
         var t3 = await Downloading(2);
         t3.Pause();
         await run3;
-        Check(t3.Stage == DownloadTaskStage.Paused && PartExists(), $"manager: pause keeps the .part ({t3.Stage}, part exists: {PartExists()})");
+        Check(t3.Stage == DownloadTaskStage.Paused && t3.PausedFromStage == DownloadTaskStage.Downloading && PartExists(),
+            $"manager: pause keeps the .part and the previous progress stage ({t3.Stage}, part exists: {PartExists()})");
         Check(manager.HasActiveTask(t3.Request.DeduplicationKey), "manager: a paused task still blocks a duplicate push");
         manager.ResumeTask(t3);
         await WaitUntilAsync(() => t3.IsListed ? null : t3, "resumed task to finish", 90000);
@@ -533,6 +541,22 @@ internal static class Program
         manager.CancelTask(t5);
         await run5;
         Check(t5.Stage == DownloadTaskStage.Cancelled && !PartExists(), $"manager: pause immediately followed by cancel ends as Cancelled ({t5.Stage})");
+
+        // 6. 插件卸载必须等管线释放句柄；仍保留续传现场，也不能误写成用户取消历史。
+        var run6 = manager.EnqueueAsync(R("slow"));
+        var t6 = await Downloading(5);
+        var historyCount = Plugin.HistoryCollection.Count;
+        await manager.ShutdownAsync();
+        var canOpenExclusively = false;
+        try
+        {
+            using var part = new FileStream(pack + ".part", FileMode.Open, FileAccess.ReadWrite, FileShare.None);
+            canOpenExclusively = true;
+        }
+        catch (IOException) { }
+        Check(t6.Stage == DownloadTaskStage.Failed && canOpenExclusively && Plugin.HistoryCollection.Count == historyCount,
+            "manager: shutdown waits for file handles to close and preserves resume data without cancellation history");
+        await run6;
         Check(host.Errors == 0, $"manager: no error events were raised during the scenarios ({host.Errors})");
     }
 

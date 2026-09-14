@@ -5,6 +5,7 @@ using System.Threading;
 using System.Threading.Tasks;
 using GalgameManager.WinApp.Base.Contracts;
 using Microsoft.UI.Xaml.Controls;
+using PotatoVN.App.PluginBase.Helper;
 using PotatoVN.App.PluginBase.Models;
 
 namespace PotatoVN.App.PluginBase.Services;
@@ -49,13 +50,25 @@ public class DownloadTask
 
     public CancelRequestKind CancelRequest { get; private set; } = CancelRequestKind.None;
 
-    public DownloadTaskStage Stage { get; internal set; } = DownloadTaskStage.Pending;
-    public string Message { get; internal set; } = string.Empty;
+    private volatile DownloadTaskStage _stage = DownloadTaskStage.Pending;
+    private volatile string _message = string.Empty;
+    public DownloadTaskStage Stage { get => _stage; internal set => _stage = value; }
+    public string Message { get => _message; internal set => _message = value; }
+    /// <summary>暂停前的阶段决定应保留哪一种进度；未知解压总量时不能退回下载的满进度。</summary>
+    public DownloadTaskStage PausedFromStage { get; internal set; } = DownloadTaskStage.Pending;
     public long Total { get; }
 
     private long _received;
+    private UnpackProgress? _unpackProgress;
 
-    /// <summary>已落盘字节数（下载线程每次读取后写入；分块并发时偶有微小回退）。Interlocked 保证 x86 上 64 位读写不撕裂。</summary>
+    /// <summary>一次发布完整的解压快照，避免面板读到不同回调的文件名、字节数和总量。</summary>
+    public UnpackProgress? UnpackProgress
+    {
+        get => Volatile.Read(ref _unpackProgress);
+        internal set => Volatile.Write(ref _unpackProgress, value);
+    }
+
+    /// <summary>已写入字节数：分块传输单调递增；顺序源拒绝续传而从头重下时会重置。Interlocked 保证 x86 上 64 位读写不撕裂。</summary>
     public long Received
     {
         get => Interlocked.Read(ref _received);
@@ -89,8 +102,8 @@ public class DownloadTask
         Cts = new CancellationTokenSource();
     }
 
-    /// <summary>进度百分比 0-100。</summary>
-    public double ProgressPercent => Total <= 0 ? 0 : Math.Min(100, (double)Received / Total * 100);
+    /// <summary>下载字节进度：向下截到一位小数，任务完成前保留 100% 给真正的终态。</summary>
+    public double ProgressPercent => TransferProgressDisplay.Percent(Received, Total, Stage == DownloadTaskStage.Completed);
 
     public bool IsActive => Stage is DownloadTaskStage.Pending or DownloadTaskStage.Downloading
         or DownloadTaskStage.Verifying or DownloadTaskStage.Unpacking or DownloadTaskStage.Importing;
@@ -131,6 +144,16 @@ public class DownloadManager
     /// 更新或卸载时 DLL 删除失败。已下载的 .part 与水位保留，下次推送可续传。
     /// </summary>
     public void Shutdown() => _shutdown.Cancel();
+
+    /// <summary>卸载时等待活动管线退出，确保解压流、COM 对象和原生 7z.dll 已释放后宿主再删除插件文件。</summary>
+    public async Task ShutdownAsync(CancellationToken ct = default)
+    {
+        Shutdown();
+        // 处理流程一直持有 _gate；取得它说明该流程的 finally/Dispose 已经全部执行。
+        // 仅等待当前流程，不枚举 UI 所有的 Tasks 集合；排队任务会被 _shutdown 直接取消。
+        await _gate.WaitAsync(ct).ConfigureAwait(false);
+        _gate.Release();
+    }
 
     /// <summary>
     /// 收到新推送时入队并开始处理。同一资源已有活动/暂停任务时忽略；
@@ -217,6 +240,7 @@ public class DownloadManager
             }
             if (task.CancelRequest == CancelRequestKind.Pause)
             {
+                task.PausedFromStage = task.Stage;
                 task.Message = "已暂停";
                 task.Stage = DownloadTaskStage.Paused;
                 return;
@@ -321,6 +345,7 @@ public class DownloadManager
 
             // 2. 下载（多线程分块 + 断点续传）。每次网络读取都更新 Received；速度由面板按采样周期计算。
             //    心跳日志（Warning 级始终落 log.txt）：排查「面板不动」时分辨下载侧停滞与显示侧冻结
+            task.UnpackProgress = null;
             task.Message = "下载中...";
             task.Stage = DownloadTaskStage.Downloading;
             using var heartbeat = new Timer(_ => _hostApi.Log(InfoBarSeverity.Warning,
@@ -334,7 +359,7 @@ public class DownloadManager
             }
 
             // 3. 校验：失败的文件必须删掉，否则下次会被当作已下载完成直接复用，永远校验失败
-            task.Message = "校验中...";
+            task.Message = "正在校验压缩包完整性…";
             task.Stage = DownloadTaskStage.Verifying;
             try
             {
@@ -347,14 +372,13 @@ public class DownloadManager
             }
 
             // 4. 解压：目录名来自压缩包内容，落在下载目录内；不删除任何不是本插件创建的目录
-            task.Message = "解压中...";
+            task.Message = "正在读取压缩包…";
             task.Stage = DownloadTaskStage.Unpacking;
-            var gameDirName = UnpackService.ResolveGameDirectoryName(task.Request, packPath);
+            var gameDirName = UnpackService.ResolveGameDirectoryName(task.Request, packPath, ct);
             var gamePath = UnpackService.PrepareGameDirectory(downloadDir, gameDirName);
             task.GamePath = gamePath;
             await UnpackService.UnpackAsync(task.Request, packPath, gamePath,
-                (finished, total) => task.Message = total > 0 ? $"解压中 {finished}/{total}" : $"解压中 {finished} 个文件",
-                ct);
+                ct: ct, onDetailedProgress: progress => task.UnpackProgress = progress);
 
             // 5. 入库 + 刮削：占位游戏到这里才创建，下载失败的任务不会在库里留下空条目
             task.Message = "入库刮削中...";
