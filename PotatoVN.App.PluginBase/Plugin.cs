@@ -35,6 +35,8 @@ namespace PotatoVN.App.PluginBase
             _hostApi = hostApi;
             HostApi = hostApi;
             XamlResourceLocatorFactory.PackagePath = _hostApi.GetPluginPath();
+            // 宿主可能从内存加载插件程序集，原生 7z 必须从宿主给出的插件目录定位。
+            SevenZipUnpacker.SetPluginDirectory(XamlResourceLocatorFactory.PackagePath);
             PluginLocalization.Initialize(hostApi); //初始化插件多国语言支持，如果你的插件不需要支持多语言，可以不调用这个方法，直接在代码里写死字符串即可。
             //注意：本插件UI一律使用纯C#构建，不要调用ResourceLoader加载XAML资源字典
             //（插件XAML依赖宿主v1.10.1+的承载机制，旧宿主上会XamlParseException）。
@@ -70,6 +72,7 @@ namespace PotatoVN.App.PluginBase
             if (cts.IsCancellationRequested) return;
             DownloadManager?.Shutdown(); // 先停下载：后台任务持有程序集与文件句柄，不停会导致 DLL 删除失败
             if (_pushService is not null) await _pushService.StopAsync();
+            if (DownloadManager is not null) await DownloadManager.ShutdownAsync(cts);
         }
 
         /// <summary>启动一次下载流程；流程内部已捕获业务异常，这里只兜底记录意外错误。</summary>
@@ -138,6 +141,15 @@ namespace PotatoVN.App.PluginBase
         {
             while (_confirmQueue.TryDequeue(out var request))
             {
+                // 同一资源已在下载（用户重复点击同一链接，或激活被重复投递）：不再弹确认框，
+                // 直接亮出下载面板让用户看到正在进行中的任务。此处已在主线程，遍历 Tasks 安全。
+                if (DownloadManager.HasActiveTask(request.DeduplicationKey))
+                {
+                    _hostApi.Log(Microsoft.UI.Xaml.Controls.InfoBarSeverity.Warning,
+                        $"PotatoDownload: push ignored, download already active ({request.Title})");
+                    ShowDownloadDialog();
+                    continue;
+                }
                 var window = _hostApi.GetMainWindow();
                 if (window is null)
                 {

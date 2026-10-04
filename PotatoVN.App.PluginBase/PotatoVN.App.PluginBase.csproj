@@ -147,6 +147,13 @@ StampedFiles = stampedFiles.ToArray();
     <Resource Remove="artifacts\plugin.pvnplugin\PotatoVN.App.PluginBase\Controls\UserControl1.xaml" />
   </ItemGroup>
   <ItemGroup>
+    <!-- 原生解压资产使用插件私有目录；不能放到 PackPlugin 会清理的 runtimes 下。 -->
+    <None Update="Native\7zip\**\*">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+      <CopyToPublishDirectory>PreserveNewest</CopyToPublishDirectory>
+    </None>
+  </ItemGroup>
+  <ItemGroup>
     <Page Update="Controls\DownloadProgressDialog.xaml">
       <Generator>MSBuild:Compile</Generator>
     </Page>
@@ -236,6 +243,11 @@ StampedFiles = stampedFiles.ToArray();
 
 		<Delete Files="@(_PluginBlacklistFiles)" />
         <RemoveDir Directories="$(_PluginTempDir)runtimes" />
+
+        <!-- 任一架构的 DLL 缺失都不允许产出一个安装成功却无法解压的发布包。 -->
+        <Error Condition="!Exists('$(_PluginTempDir)Native\7zip\win-x86\7z.dll')" Text="插件包缺少 win-x86/7z.dll。" />
+        <Error Condition="!Exists('$(_PluginTempDir)Native\7zip\win-x64\7z.dll')" Text="插件包缺少 win-x64/7z.dll。" />
+        <Error Condition="!Exists('$(_PluginTempDir)Native\7zip\win-arm64\7z.dll')" Text="插件包缺少 win-arm64/7z.dll。" />
 
 		<!-- 确保打包输出目录存在 -->
 		<MakeDir Directories="$(PluginPackageOutputDir)" />

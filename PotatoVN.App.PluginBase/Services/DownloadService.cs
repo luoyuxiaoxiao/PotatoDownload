@@ -6,6 +6,7 @@ using System.Net;
 using System.Net.Http;
 using System.Net.Http.Headers;
 using System.Net.Sockets;
+using System.Runtime.ExceptionServices;
 using System.Security.Cryptography;
 using System.Threading;
 using System.Threading.Tasks;
@@ -21,28 +22,39 @@ namespace PotatoVN.App.PluginBase.Services;
 /// 断点续传通过 .part 文件 + 水位记录实现，水位 = 从文件头起连续已落盘的字节数，
 /// 中断后再次下载只重下水位之后的部分。
 /// 本类只保证落盘字节数与声明的 size 一致；哈希校验由调用方在下载完成后执行。
+/// 重试策略对齐 ReinaManager（takanawa）：网络错误/空闲超时/408/429/5xx 指数退避重试，
+/// 确定性错误（越界数据、范围不符、4xx 拒绝）不重试；任一块彻底失败立即中止整个下载。
 /// </summary>
 public class DownloadService : IDisposable
 {
-    private const int ChunkSize = 4 * 1024 * 1024; // 每块 4MB
-    private const int MaxConnections = 4;          // 分块并发连接数
-    private const int MaxRetries = 3;              // 单块失败重试次数
+    private const int DefaultChunkSize = 64 * 1024 * 1024; // 大文件每块 64MiB，减少请求切换和代理租约释放造成的空档
+    private const int MinimumChunkSize = 16 * 1024 * 1024; // 小文件保留原有并发能力，不为凑大块而减少活跃连接
+    // 分块并发连接数。Shionlib 下载代理按会话最多 8 个租约（ReinaManager 也开 8），租约要等响应管道结束才释放，
+    // 留 2 个名额给释放延迟与探测请求；真撞上限也只是 429 → 退避重试，不致命
+    private const int MaxConnections = 6;
+    private const int DefaultMaxAttempts = 5;             // 单个请求（探测/分块/顺序）最多尝试次数
     private const int BufferSize = 81920;
     private static readonly TimeSpan DefaultIdleTimeout = TimeSpan.FromSeconds(60);
 
     private readonly HttpClient _httpClient;
     private readonly TimeSpan _idleTimeout;
+    private readonly int _chunkSize;
+
+    /// <summary>瞬时错误的最多尝试次数（测试用）。</summary>
+    internal int MaxAttempts { get; init; } = DefaultMaxAttempts;
 
     public DownloadService() : this(CreateSafeHandler(), DefaultIdleTimeout)
     {
     }
 
-    /// <summary>自定义传输层与空闲超时（测试用）。</summary>
-    internal DownloadService(HttpMessageHandler handler, TimeSpan idleTimeout)
+    /// <summary>自定义传输层、空闲超时与块大小（测试用）。</summary>
+    internal DownloadService(HttpMessageHandler handler, TimeSpan idleTimeout, int chunkSize = DefaultChunkSize)
     {
         _idleTimeout = idleTimeout;
+        _chunkSize = chunkSize;
         _httpClient = new HttpClient(handler) { Timeout = Timeout.InfiniteTimeSpan };
         _httpClient.DefaultRequestHeaders.UserAgent.ParseAdd("PotatoVN-PotatoDownload/1.0");
+        _httpClient.DefaultRequestHeaders.AcceptEncoding.ParseAdd("identity"); // 分块按字节偏移落盘，不许服务端压缩
     }
 
     public void Dispose() => _httpClient.Dispose();
@@ -82,10 +94,13 @@ public class DownloadService : IDisposable
     /// </summary>
     /// <param name="request">安装请求（含 URL、预期大小）</param>
     /// <param name="targetPath">最终文件存放路径（下载完成即挪到此处）</param>
-    /// <param name="onProgress">进度回调 (已提交字节, 总字节)</param>
+    /// <param name="onProgress">进度回调 (已写入字节, 总字节)；每次写入都会回调，可能来自多个后台线程，
+    /// 分块并发时按累计字节递增顺序串行通知；顺序下载被服务端拒绝续传时仍需从 0 重启</param>
     /// <param name="ct">取消令牌</param>
+    /// <param name="log">可选诊断日志（下载路径决策、重试），仅落文字不携带敏感信息</param>
     public async Task DownloadAsync(InstallRequest request, string targetPath,
-        Action<long, long>? onProgress = null, CancellationToken ct = default)
+        Action<long, long>? onProgress = null, CancellationToken ct = default,
+        Action<string>? log = null)
     {
         if (request.IsExpired(DateTimeOffset.Now))
             throw new DownloadException("下载直链已过期，请重新从来源提供方获取链接");
@@ -94,6 +109,7 @@ public class DownloadService : IDisposable
         if (File.Exists(targetPath) && new FileInfo(targetPath).Length == totalBytes)
         {
             // 上次已下载完整（例如在解压/入库阶段失败）——直接复用，由调用方重新校验哈希
+            log?.Invoke("target already complete, skip download");
             onProgress?.Invoke(totalBytes, totalBytes);
             return;
         }
@@ -108,15 +124,26 @@ public class DownloadService : IDisposable
         try
         {
             if (IsAlreadyComplete(partPath, watermarkPath, totalBytes))
+            {
+                log?.Invoke("reuse complete .part, skip download");
                 onProgress?.Invoke(totalBytes, totalBytes);
-            else if (await ProbeRangeAsync(request.Url, ct))
-                await DownloadChunkedAsync(request, partPath, watermarkPath, onProgress, ct);
+            }
+            else if (await ProbeRangeAsync(request.Url, ct, log))
+            {
+                var chunkSize = GetChunkSize(totalBytes);
+                log?.Invoke($"probe: range supported, chunked download ({(totalBytes + chunkSize - 1) / chunkSize} chunks, up to {MaxConnections} connections, chunk size {chunkSize} bytes)");
+                await DownloadChunkedAsync(request, partPath, watermarkPath, chunkSize, onProgress, ct, log);
+            }
             else
-                await DownloadSequentialAsync(request, partPath, watermarkPath, onProgress, ct);
+            {
+                log?.Invoke("probe: range NOT supported, sequential download");
+                await RetryAsync(() => DownloadSequentialAsync(request, partPath, watermarkPath, onProgress, ct),
+                    ct, log, "sequential download");
+            }
         }
         catch (OperationCanceledException) when (!ct.IsCancellationRequested)
         {
-            // 不是调用方取消，而是空闲计时器触发：服务器长时间没有返回数据
+            // 不是调用方取消，而是空闲计时器触发（重试耗尽）：服务器长时间没有返回数据
             throw new DownloadException("连接空闲超时，服务器长时间未返回数据");
         }
 
@@ -140,51 +167,102 @@ public class DownloadService : IDisposable
         }
     }
 
-    /// <summary>探测服务器是否支持 HTTP Range（发一个小 Range 请求看是否回 206）。</summary>
-    private async Task<bool> ProbeRangeAsync(string url, CancellationToken ct)
-    {
-        try
+    /// <summary>
+    /// 探测服务器是否支持 HTTP Range（发一个 1 字节 Range 请求看是否回 206）。
+    /// 瞬时错误按统一策略重试——探测时撞上一次 429/5xx 就静默退化成单连接会把整个下载拖慢数倍；
+    /// 明确拒绝（401/403/404 等）直接失败，避免用一条更难懂的顺序下载错误代替真正原因。
+    /// </summary>
+    private Task<bool> ProbeRangeAsync(string url, CancellationToken ct, Action<string>? log) =>
+        RetryAsync(async () =>
         {
             using var idle = CreateIdleCts(ct);
             using var request = new HttpRequestMessage(HttpMethod.Get, url);
             request.Headers.Range = new RangeHeaderValue(0, 0);
             using var response = await SendAsync(request, idle.Token);
-            return response.StatusCode == HttpStatusCode.PartialContent;
-        }
-        catch (OperationCanceledException) when (ct.IsCancellationRequested)
+            if (response.StatusCode == HttpStatusCode.PartialContent)
+            {
+                // 把这 1 个字节读完再放手：连接干净归还连接池，代理侧（Shionlib 按会话计连接数）也能立刻释放这条连接的名额
+                await response.Content.ReadAsByteArrayAsync(idle.Token);
+                return true;
+            }
+            ThrowIfFailed(response);
+            return false; // 2xx 但没按 Range 返回：服务器不支持 Range
+        }, ct, log, "probe");
+
+    /// <summary>非成功状态码分类：408/429/5xx 是瞬时错误（进入重试），其余直接判定失败。</summary>
+    private static void ThrowIfFailed(HttpResponseMessage response)
+    {
+        var code = (int)response.StatusCode;
+        if (code is >= 200 and < 300) return;
+        if (code is 408 or 429 or >= 500)
+            throw new HttpRequestException($"服务器暂时不可用（HTTP {code}）", null, response.StatusCode);
+        throw new DownloadException($"服务器拒绝了下载请求（HTTP {code}），直链可能已失效");
+    }
+
+    /// <summary>
+    /// 瞬时错误重试（对齐 takanawa：指数退避 1/2/4/8s）。网络错误、空闲超时、408/429/5xx 可重试；
+    /// 调用方取消与 <see cref="DownloadException"/>（确定性错误）立即抛出。
+    /// </summary>
+    private async Task<T> RetryAsync<T>(Func<Task<T>> action, CancellationToken ct, Action<string>? log, string what)
+    {
+        for (var attempt = 1; ; attempt++)
         {
-            throw;
-        }
-        catch
-        {
-            return false;
+            try
+            {
+                return await action();
+            }
+            catch (OperationCanceledException) when (ct.IsCancellationRequested)
+            {
+                throw;
+            }
+            catch (DownloadException)
+            {
+                throw;
+            }
+            catch (Exception e) when (attempt < MaxAttempts)
+            {
+                var delay = TimeSpan.FromSeconds(Math.Min(8, 1 << (attempt - 1))); // ≥ Shionlib 限流回复的 Retry-After: 1
+                var reason = e is OperationCanceledException ? "idle timeout" : $"{e.GetType().Name}: {e.Message}";
+                log?.Invoke($"{what}: attempt {attempt}/{MaxAttempts} failed ({reason}), retrying in {delay.TotalSeconds:F0}s");
+                await Task.Delay(delay, ct);
+            }
         }
     }
 
+    private Task RetryAsync(Func<Task> action, CancellationToken ct, Action<string>? log, string what) =>
+        RetryAsync(async () =>
+        {
+            await action();
+            return 0;
+        }, ct, log, what);
+
     /// <summary>多线程分块下载：每个连接认领块，按 Range 写入文件对应偏移。</summary>
     private async Task DownloadChunkedAsync(InstallRequest request, string partPath,
-        string watermarkPath, Action<long, long>? onProgress, CancellationToken ct)
+        string watermarkPath, int chunkSize, Action<long, long>? onProgress, CancellationToken ct, Action<string>? log)
     {
         var totalBytes = (long)request.Size;
-        var chunkCount = (int)((totalBytes + ChunkSize - 1) / ChunkSize);
+        var chunkCount = (int)((totalBytes + chunkSize - 1) / chunkSize);
 
         // 水位是连续前缀：块会乱序完成，只有从头连续完成的字节才能记为水位，续传才不会漏块
-        var contiguous = ReadWatermark(watermarkPath, totalBytes);
+        var contiguous = File.Exists(partPath)
+            ? ReadWatermark(watermarkPath, Math.Min(totalBytes, new FileInfo(partPath).Length)) : 0;
         var completed = new bool[chunkCount];
-        var committed = 0L;
+        var offsets = new long[chunkCount]; // 每块下一个未写入的位置，只有认领该块的 worker 会推进
+        var received = contiguous; // 包含旧水位在新块中间的部分，不因调整块大小而重下已有前缀
         var pending = new ConcurrentQueue<int>();
         for (var i = 0; i < chunkCount; i++)
         {
-            if (ChunkEnd(i, totalBytes) < contiguous)
+            offsets[i] = Math.Clamp(contiguous, ChunkStart(i, chunkSize), ChunkEnd(i, chunkSize, totalBytes) + 1);
+            if (ChunkEnd(i, chunkSize, totalBytes) < contiguous)
             {
                 completed[i] = true;
-                committed += ChunkEnd(i, totalBytes) - (long)i * ChunkSize + 1;
             }
             else
             {
                 pending.Enqueue(i);
             }
         }
+        onProgress?.Invoke(received, totalBytes);
 
         // 预分配完整大小；各连接用 RandomAccess 按偏移写入（共享一个 FileStream 的 Seek+Write 不是线程安全的）
         using (var stream = new FileStream(partPath, FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.None))
@@ -194,107 +272,142 @@ public class DownloadService : IDisposable
         using var handle = File.OpenHandle(partPath, FileMode.Open, FileAccess.Write, FileShare.None,
             FileOptions.Asynchronous);
 
+        // 任一块彻底失败（重试耗尽/确定性错误）立即中止其余连接。否则幸存连接会以越来越低的并发把队列耗完，
+        // 表现为「越下越慢」，而失败要等它们全部结束才浮现（2026-09 线上症状）
+        using var abort = CancellationTokenSource.CreateLinkedTokenSource(ct);
+        var token = abort.Token;
         var nextContiguousChunk = 0;
         var gate = new object();
+        var progressGate = new object();
         var workers = new Task[Math.Clamp(pending.Count, 1, MaxConnections)];
         for (var w = 0; w < workers.Length; w++)
             workers[w] = Task.Run(async () =>
             {
-                while (pending.TryDequeue(out var chunkIndex))
+                try
                 {
-                    ct.ThrowIfCancellationRequested();
-                    var start = (long)chunkIndex * ChunkSize;
-                    var end = ChunkEnd(chunkIndex, totalBytes);
-                    await DownloadChunkWithRetryAsync(request.Url, handle, start, end, ct);
-                    lock (gate)
+                    while (pending.TryDequeue(out var chunkIndex))
                     {
-                        completed[chunkIndex] = true;
-                        committed += end - start + 1;
-                        while (nextContiguousChunk < chunkCount && completed[nextContiguousChunk])
-                            nextContiguousChunk++;
-                        var reached = nextContiguousChunk == chunkCount
-                            ? totalBytes
-                            : (long)nextContiguousChunk * ChunkSize;
-                        if (reached > contiguous)
+                        token.ThrowIfCancellationRequested();
+                        var end = ChunkEnd(chunkIndex, chunkSize, totalBytes);
+                        // 瞬时断流保留本块已经写好的字节，下一次只请求剩余部分；整块回退会把 UI 的速度增量拉成负数。
+                        await RetryAsync(() => DownloadChunkAsync(request.Url, handle, offsets[chunkIndex], end,
+                                delta =>
+                                {
+                                    offsets[chunkIndex] += delta;
+                                    // Interlocked.Add 后再回调仍可能乱序，计数和通知必须在同一临界区内完成。
+                                    lock (progressGate)
+                                    {
+                                        received += delta;
+                                        onProgress?.Invoke(received, totalBytes);
+                                    }
+                                }, token),
+                            token, log, $"chunk {chunkIndex}");
+                        lock (gate)
                         {
-                            contiguous = reached;
-                            SaveWatermark(watermarkPath, contiguous);
+                            completed[chunkIndex] = true;
+                            while (nextContiguousChunk < chunkCount && completed[nextContiguousChunk])
+                                nextContiguousChunk++;
+                            var reached = nextContiguousChunk == chunkCount
+                                ? totalBytes
+                                : ChunkStart(nextContiguousChunk, chunkSize);
+                            if (reached > contiguous)
+                            {
+                                contiguous = reached;
+                                SaveWatermark(watermarkPath, contiguous);
+                            }
                         }
-                        onProgress?.Invoke(committed, totalBytes);
                     }
                 }
-            }, ct);
-        await Task.WhenAll(workers);
-    }
-
-    private static long ChunkEnd(int chunkIndex, long totalBytes) =>
-        Math.Min((long)(chunkIndex + 1) * ChunkSize, totalBytes) - 1;
-
-    private async Task DownloadChunkWithRetryAsync(string url, SafeFileHandle handle,
-        long start, long end, CancellationToken ct)
-    {
-        for (var attempt = 0; ; attempt++)
+                catch
+                {
+                    abort.Cancel();
+                    throw;
+                }
+            }, token);
+        try
         {
-            try
+            await Task.WhenAll(workers);
+        }
+        catch when (!ct.IsCancellationRequested)
+        {
+            // WhenAll 抛的是数组里第一个失败的任务，可能只是被中止的旁路连接（OCE）——找真正的根因抛出
+            var root = workers.Select(worker => worker.Exception?.GetBaseException())
+                .FirstOrDefault(e => e is not null and not OperationCanceledException);
+            if (root is not null) ExceptionDispatchInfo.Capture(root).Throw();
+            throw;
+        }
+        finally
+        {
+            // 所有 worker 都已停止，再保存第一个未完成块的有效前缀；不能跨过空洞，也不丢掉大块内的暂停进度。
+            // RandomAccess.WriteAsync 完成后才推进 offsets，因此这里不会把尚未写入的字节记成水位。
+            var watermark = 0L;
+            for (var i = 0; i < chunkCount; i++)
             {
-                await DownloadChunkAsync(url, handle, start, end, ct);
-                return;
+                watermark = offsets[i];
+                if (watermark < ChunkEnd(i, chunkSize, totalBytes) + 1) break;
             }
-            catch (OperationCanceledException) when (ct.IsCancellationRequested)
-            {
-                throw;
-            }
-            catch (DownloadException)
-            {
-                throw; // 我们自己判定的确定性错误（越界数据、SSRF 拒绝等），重试无意义
-            }
-            catch (Exception) when (attempt < MaxRetries - 1)
-            {
-                await Task.Delay(500 * (attempt + 1), ct);
-            }
+            SaveWatermark(watermarkPath, watermark);
         }
     }
 
+    private int GetChunkSize(long totalBytes) =>
+        (int)Math.Min(_chunkSize, Math.Max(MinimumChunkSize, (totalBytes + MaxConnections - 1) / MaxConnections));
+
+    private static long ChunkStart(int chunkIndex, int chunkSize) => (long)chunkIndex * chunkSize;
+
+    private static long ChunkEnd(int chunkIndex, int chunkSize, long totalBytes) =>
+        Math.Min((long)(chunkIndex + 1) * chunkSize, totalBytes) - 1;
+
+    /// <summary>下载分块尚未写入的范围。<paramref name="report"/> 每次写入报告正增量，失败重试保留此前已写的前缀。</summary>
     private async Task DownloadChunkAsync(string url, SafeFileHandle handle,
-        long start, long end, CancellationToken ct)
+        long start, long end, Action<long> report, CancellationToken ct)
     {
+        if (start > end) return;
         using var idle = CreateIdleCts(ct);
         using var request = new HttpRequestMessage(HttpMethod.Get, url);
         request.Headers.Range = new RangeHeaderValue(start, end);
         using var response = await SendAsync(request, idle.Token);
         if (response.StatusCode != HttpStatusCode.PartialContent)
+        {
+            ThrowIfFailed(response);
             throw new DownloadException($"服务器未按 Range 返回分块（状态码 {(int)response.StatusCode}）");
+        }
+        var length = end - start + 1;
+        if (response.Content.Headers.ContentRange is { From: { } from, To: { } to } && (from != start || to != end))
+            throw new DownloadException($"服务器返回的分块范围不符：请求 {start}-{end}，返回 {from}-{to}");
+        if (response.Content.Headers.ContentLength is { } declared && declared != length)
+            throw new DownloadException($"服务器返回的分块长度不符：期望 {length}，返回 {declared}");
 
         await using var contentStream = await response.Content.ReadAsStreamAsync(idle.Token);
         var buffer = new byte[BufferSize];
-        var offset = start;
-        var remaining = end - start + 1;
+        var written = 0L;
         int read;
-        while (remaining > 0 && (read = await ReadAsync(contentStream, buffer, idle)) > 0)
+        while (written < length && (read = await ReadAsync(contentStream, buffer, idle)) > 0)
         {
-            if (read > remaining)
+            if (written + read > length)
                 throw new DownloadException("服务器返回的数据超出请求的分块范围");
-            await RandomAccess.WriteAsync(handle, buffer.AsMemory(0, read), offset, ct);
-            offset += read;
-            remaining -= read;
+            await RandomAccess.WriteAsync(handle, buffer.AsMemory(0, read), start + written, ct);
+            written += read;
+            report(read);
         }
-        if (remaining > 0)
-            throw new IOException($"分块数据不完整，还差 {remaining} 字节");
+        if (written < length)
+            throw new IOException($"分块数据不完整，还差 {length - written} 字节");
     }
 
-    /// <summary>单连接顺序下载：服务器不支持 Range 时的退化方案（可断点续传）。</summary>
+    /// <summary>单连接顺序下载：服务器不支持 Range 时的退化方案（可断点续传，重试时按水位续传）。</summary>
     private async Task DownloadSequentialAsync(InstallRequest request, string partPath,
         string watermarkPath, Action<long, long>? onProgress, CancellationToken ct)
     {
         var totalBytes = (long)request.Size;
-        var committed = ReadWatermark(watermarkPath, totalBytes);
+        var committed = File.Exists(partPath)
+            ? ReadWatermark(watermarkPath, Math.Min(totalBytes, new FileInfo(partPath).Length)) : 0;
 
         using var idle = CreateIdleCts(ct);
         using var httpRequest = new HttpRequestMessage(HttpMethod.Get, request.Url);
         if (committed > 0)
             httpRequest.Headers.Range = new RangeHeaderValue(committed, null);
         using var response = await SendAsync(httpRequest, idle.Token);
-        response.EnsureSuccessStatusCode();
+        ThrowIfFailed(response);
 
         if (committed > 0 && response.StatusCode != HttpStatusCode.PartialContent)
         {
@@ -315,27 +428,35 @@ public class DownloadService : IDisposable
 
         var buffer = new byte[BufferSize];
         var lastWatermark = committed;
-        int read;
-        while ((read = await ReadAsync(contentStream, buffer, idle)) > 0)
+        onProgress?.Invoke(committed, totalBytes);
+        try
         {
-            if (committed + read > totalBytes)
-                throw new DownloadException($"服务器返回的数据超出声明大小 {totalBytes} 字节");
-            await fileStream.WriteAsync(buffer.AsMemory(0, read), ct);
-            committed += read;
-            onProgress?.Invoke(committed, totalBytes);
-            if (committed - lastWatermark >= ChunkSize)
+            int read;
+            while ((read = await ReadAsync(contentStream, buffer, idle)) > 0)
             {
-                // 先落盘再记水位，水位永远不会领先于文件里真正写好的字节
-                await fileStream.FlushAsync(ct);
-                SaveWatermark(watermarkPath, committed);
-                lastWatermark = committed;
+                if (committed + read > totalBytes)
+                    throw new DownloadException($"服务器返回的数据超出声明大小 {totalBytes} 字节");
+                await fileStream.WriteAsync(buffer.AsMemory(0, read), ct);
+                committed += read;
+                onProgress?.Invoke(committed, totalBytes);
+                if (committed - lastWatermark >= Math.Min(_chunkSize, MinimumChunkSize))
+                {
+                    // 顺序模式仍按原有 16MiB 间隔记水位，不随并发块大小一起放大。
+                    await fileStream.FlushAsync(ct);
+                    SaveWatermark(watermarkPath, committed);
+                    lastWatermark = committed;
+                }
             }
-        }
-        await fileStream.FlushAsync(ct);
-        SaveWatermark(watermarkPath, committed);
 
-        if (committed != totalBytes)
-            throw new DownloadException($"文件大小校验失败：期望 {totalBytes}，实际 {committed}");
+            if (committed != totalBytes)
+                throw new IOException($"连接中断：期望 {totalBytes} 字节，实际 {committed}");
+        }
+        finally
+        {
+            // 中断时也先刷出文件缓冲再记精确水位；取消令牌此时可能已触发，不能再用它打断这一步收尾。
+            await fileStream.FlushAsync(CancellationToken.None);
+            SaveWatermark(watermarkPath, committed);
+        }
     }
 
     private async Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken ct)

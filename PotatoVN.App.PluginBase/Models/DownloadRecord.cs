@@ -7,6 +7,7 @@ public class DownloadRecord
 {
     public const string OutcomeCompleted = "Completed";
     public const string OutcomeFailed = "Failed";
+    public const string OutcomeCancelled = "Cancelled";
 
     public string Title { get; set; } = string.Empty;
     public long Size { get; set; }

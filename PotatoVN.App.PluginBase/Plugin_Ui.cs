@@ -102,13 +102,14 @@ public partial class Plugin : IGalgamePageLeftPanel, IGalgamePageRightPanel
             _downloadDialogOpen = true;
             EnqueueDialog(async () =>
             {
+                var content = new DownloadProgressDialog();
                 try
                 {
                     var dialog = new ContentDialog
                     {
                         XamlRoot = window.Content.XamlRoot,
                         Title = "下载",
-                        Content = new DownloadProgressDialog(),
+                        Content = content,
                         CloseButtonText = "关闭",
                         DefaultButton = ContentDialogButton.Close,
                     };
@@ -116,6 +117,8 @@ public partial class Plugin : IGalgamePageLeftPanel, IGalgamePageRightPanel
                 }
                 finally
                 {
+                    // 面板的刷新计时器与集合订阅在这里确定性释放：不依赖 Unloaded（关闭未必触发、打开时可能虚发）
+                    content.Detach();
                     _downloadDialogOpen = false;
                 }
             });
