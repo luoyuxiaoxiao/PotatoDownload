@@ -36,6 +36,7 @@ namespace PotatoVN.App.PluginBase
     public static class Plugin
     {
         public static string DownloadPath { get; set; } = string.Empty;
+        public static bool AutoUnpack { get; set; } = true;
         internal static string DefaultDownloadPath => DownloadPath;
         internal static ObservableCollection<DownloadRecord> HistoryCollection { get; } = [];
         internal static void SaveDataNow() { }

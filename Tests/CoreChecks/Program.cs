@@ -237,6 +237,18 @@ internal static class Program
         var e10 = await Throws(() => new DownloadService().DownloadAsync(R("ok"), Target("ssrf.bin")));
         Check(e10 is DownloadException && e10.Message.Contains("内网"), $"download: default handler refuses loopback at connect time ({e10?.GetType().Name}: {e10?.Message})");
 
+        // 10b. 请求层守卫单测：字面回环/私网/localhost 直接拒，公网字面 IP 不用 DNS 即放行
+        Check(await Throws(() => DownloadService.EnsureTargetAllowedAsync(new Uri("http://127.0.0.1:1/x"))) is DownloadException,
+            "guard: literal loopback rejected at request layer");
+        Check(await Throws(() => DownloadService.EnsureTargetAllowedAsync(new Uri("http://localhost/"))) is DownloadException,
+            "guard: localhost rejected before DNS");
+        Check(await Throws(() => DownloadService.EnsureTargetAllowedAsync(new Uri("http://[::1]/"))) is DownloadException,
+            "guard: IPv6 loopback rejected");
+        Check(await Throws(() => DownloadService.EnsureTargetAllowedAsync(new Uri("http://192.168.1.1/"))) is DownloadException,
+            "guard: private IPv4 rejected");
+        Check(await Throws(() => DownloadService.EnsureTargetAllowedAsync(new Uri("http://1.1.1.1/"))) is null,
+            "guard: literal public IP passes without DNS");
+
         // 11. BLAKE3 参考向量（空输入）
         var empty = Target("empty.bin");
         File.WriteAllBytes(empty, []);
@@ -254,7 +266,23 @@ internal static class Program
         Check(e12 is DownloadException && e12.Message.Contains("磁盘空间不足") && !File.Exists(Target("huge.bin.part")),
             $"download: refuses to preallocate more than the free disk space ({e12?.Message})");
 
-        // 13. 真实 HTTPS（默认传输层的 TLS 走 ConnectCallback）：CORECHECKS_ONLINE=1 时启用
+        // 13. 手动跟随重定向（自动重定向已关）：Range 头跨跳保留，内容完整
+        var t13 = Target("redirect.bin");
+        var e13 = await Throws(() => NewService().DownloadAsync(R("redirect"), t13));
+        Check(e13 is null && FileSha(t13) == sha, $"download: 302 redirect followed with Range preserved ({e13?.Message})");
+        var e13b = await Throws(() => NewService().DownloadAsync(R("redirectloop"), Target("redloop.bin")));
+        Check(e13b is DownloadException && e13b.Message.Contains("重定向"), $"download: redirect loop is a deterministic failure ({e13b?.Message})");
+
+        // 14. 代理建连失败自动降级直连（模拟 MSIX 拦回环代理：AccessDenied）；降级后整任务不再走代理
+        var proxyHandler = new ProxyFailHandler();
+        using var fallbackService = new DownloadService(useProxy => useProxy ? proxyHandler : new SocketsHttpHandler(),
+            idle, 4 * 1024 * 1024) { MaxAttempts = 3, ProxySelector = _ => true, DisableTargetGuard = true };
+        var t14 = Target("fallback.bin");
+        var e14 = await Throws(() => fallbackService.DownloadAsync(R("ok"), t14));
+        Check(e14 is null && FileSha(t14) == sha, $"download: proxy connect failure falls back to direct ({e14?.Message})");
+        Check(proxyHandler.Calls == 1, $"download: after the fallback the rest of the task goes direct (proxy calls: {proxyHandler.Calls})");
+
+        // 15. 真实 HTTPS（默认传输层的 TLS 走 ConnectCallback）：CORECHECKS_ONLINE=1 时启用
         if (Environment.GetEnvironmentVariable("CORECHECKS_ONLINE") == "1")
         {
             const string onlineUrl = "https://raw.githubusercontent.com/luoyuxiaoxiao/PotatoDownload/main/LICENSE";
@@ -558,9 +586,39 @@ internal static class Program
             "manager: shutdown waits for file handles to close and preserves resume data without cancellation history");
         await run6;
         Check(host.Errors == 0, $"manager: no error events were raised during the scenarios ({host.Errors})");
+
+        // 7. AutoUnpack 关闭：校验通过后压缩包挪到下载目录根，跳过解压与入库，任务照常完成
+        Plugin.AutoUnpack = false;
+        var dirsBefore = Directory.GetDirectories(downloadDir).Length;
+        var host2 = new HostStub();
+        var manager2 = new DownloadManager(host2)
+        {
+            ServiceFactory = () => new DownloadService(new SocketsHttpHandler(), TimeSpan.FromSeconds(5), 4 * 1024 * 1024),
+        };
+        await manager2.EnqueueAsync(R("ok"));
+        var t7 = manager2.Tasks[0];
+        var kept = Path.Combine(downloadDir, "g.zip");
+        Check(t7.Stage == DownloadTaskStage.Completed && host2.Errors == 0,
+            $"manager: auto-unpack off completes without unpack/import ({t7.Stage}: {t7.Message})");
+        Check(File.Exists(kept) && FileSha(kept) == sha && !File.Exists(pack),
+            "manager: archive moved from staging to the download dir root");
+        Check(Directory.GetDirectories(downloadDir).Length == dirsBefore,
+            "manager: auto-unpack off creates no game directory");
+        Plugin.AutoUnpack = true;
     }
 
     // ---------------------------------------------------------------- 测试用 HTTP 服务器
+
+    /// <summary>永远在建连阶段失败的传输层：模拟 MSIX 拦回环代理（AccessDenied 10013）。</summary>
+    private sealed class ProxyFailHandler : HttpMessageHandler
+    {
+        public int Calls;
+        protected override Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken)
+        {
+            Interlocked.Increment(ref Calls);
+            throw new HttpRequestException("msix loopback blocked", new SocketException((int)SocketError.AccessDenied));
+        }
+    }
 
     /// <summary>本地 HTTP 服务器，按路径模拟正常与异常行为。</summary>
     private sealed class TestServer : IDisposable
@@ -672,6 +730,14 @@ internal static class Program
                             response.ContentLength64 = _payload.Length;
                             await response.OutputStream.WriteAsync(_payload);
                         }
+                        break;
+                    case "redirect": // 302 到 /ok：验证手动跟随（Range 头跨跳保留）
+                        response.StatusCode = 302;
+                        response.RedirectLocation = "/ok";
+                        break;
+                    case "redirectloop": // 302 到自己：验证重定向上限是确定性错误
+                        response.StatusCode = 302;
+                        response.RedirectLocation = "/redirectloop";
                         break;
                     case "flaky": // 前两个分块请求分别回 429 / 503，之后正常：验证瞬时错误重试
                     {
