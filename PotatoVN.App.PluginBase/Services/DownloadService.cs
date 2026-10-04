@@ -116,6 +116,8 @@ public class DownloadService : IDisposable
     /// 通道都生效；直连通道额外在建连回调里「解析+校验+钉住解析结果」，防 DNS 重绑定。
     /// 走代理时建连端点是代理本身（常为 127.0.0.1）——代理是用户自己的配置，不是 SSRF 目标，
     /// 绝不能在建连层拦它（issue #1：代理被误判内网导致整功能不可用）。
+    /// 注意：代理通道下请求层只查客户端本地 DNS，实际解析的是代理端，不抗代理端 DNS 重绑定，
+    /// 仅防误配/顺手；代理是用户可信配置且下载内容只落盘无回读，威胁模型上可接受。
     /// </summary>
     private static SocketsHttpHandler CreateSafeHandler(bool useProxy)
     {
@@ -209,6 +211,26 @@ public class DownloadService : IDisposable
         }
     }
 
+    /// <summary>任务开始时落一次通道选择（只记结论不记直链：签名 URL 绝不进日志）。</summary>
+    private void LogChannelChoice(InstallRequest request, Action<string>? log)
+    {
+        if (log is null || _singleClient is not null) return;
+        if (!Uri.TryCreate(request.Url, UriKind.Absolute, out var uri))
+        {
+            log("proxy: target URL invalid, direct");
+            return;
+        }
+        if (ShouldUseProxy(uri))
+        {
+            var via = _taskProxy?.GetProxy(uri)?.Authority ?? "proxy";
+            log($"proxy: trying {via} first, fallback to direct on connect failure");
+        }
+        else
+        {
+            log("proxy: none configured or target bypassed, direct");
+        }
+    }
+
     /// <summary>
     /// 下载文件到目标路径（支持断点续传与多线程分块）。
     /// </summary>
@@ -227,6 +249,7 @@ public class DownloadService : IDisposable
 
         _log = log;
         _taskProxy = _singleClient is null && ProxySelector is null ? CurrentSystemProxy() : null;
+        LogChannelChoice(request, log);
 
         var totalBytes = (long)request.Size;
         if (File.Exists(targetPath) && new FileInfo(targetPath).Length == totalBytes)
