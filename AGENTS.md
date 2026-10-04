@@ -75,7 +75,7 @@
 ### Feedback / Lessons
 <!-- 用户纠正过的做法 + 原因。例：- 不要 mock 数据库测试，原因：上次 mock 通过但生产迁移失败 -->
 - 仓库根必须有 NuGet.Config（globalPackagesFolder=C:\pvn-vibe\nuget-cache），否则 terminal restore 与 MCP build 缓存分裂（新包 MCP 找不到）
-- **origin remote 里的 ghs_ 安装令牌约 1h 过期（2026-10-04 实证）**：过期后 push 和 GitHub Release API 全部 401；且 MCP git_commit_and_push 失败路径会把 token 从 remote URL 剥离（set-url 成无凭据 URL），凭证管理器无缓存（GCM 交互被禁）。**恢复方式只有 link_github_repo 带用户提供的 PAT——新开会话不会重新 stamp**（2026-10-04 二次实证：新会话里 link_github_repo 不传 token 返回 has_token:false，MCP push 只沿用现有无凭据 URL 直接 401）；恢复前本地 commit 发不出去、GitHub Release 无法改
+- **origin remote 里的 ghs_ 安装令牌约 1h 过期（2026-10-04 实证）**：过期后 push 和 GitHub Release API 全部 401；且 MCP git_commit_and_push 失败路径会把 token 从 remote URL 剥离（set-url 成无凭据 URL），凭证管理器无缓存（GCM 交互被禁）。**恢复方式只有 link_github_repo 带用户提供的 PAT——新开会话不会重新 stamp**（2026-10-04 二次实证：新会话里 link_github_repo 不传 token 返回 has_token:false，MCP push 只沿用现有无凭据 URL 直接 401）；恢复前本地 commit 发不出去、GitHub Release 无法改。**link_github_repo 带 PAT 绑定后 token 只存平台侧，不会注入本地 remote URL**，需手动 `git remote set-url origin https://x-access-token:<pat>@github.com/...` 才能 push；REST API 用 `Authorization: Bearer <pat>`（2026-10-04 实证全通）
 - 插件 csproj 必须含模板的 PackPlugin/_StampPluginNamespace target 才能产出 artifacts/plugin.pvnplugin.zip；模板在 C:\pvn-vibe\plugin-base
 - 模板 csproj 无 ImplicitUsings，新 .cs 文件需手写 using System/IO/Linq/Net.Http 等
 - 带 BOM 的 .cs 文件 file_editor 会误判为二进制，用 PowerShell ReadAllText 确认内容
@@ -108,7 +108,7 @@
 - Shionlib 仓库：github.com/Ringyuki/shionlib；ReinaManager：github.com/huoshen80/ReinaManager
 - 本插件远程仓库：github.com/luoyuxiaoxiao/PotatoDownload（main 与 plan 均已推送；用户明确要求 push 到 main）
 - **分支分工（用户约定）：plan=开发线，main=发布线**；2026-09-13 起两分支插件代码一致（插件内测试功能已移除，DevReportInfo 空实现），plan 额外承载 docs/ 测验网站并作为 GitHub Pages 发布源；v0.1.0 已发布到应用市场（tag v0.1.0，包页 plugin.api.potatovn.net/pvn-plugin/package/dfb57882-7b2f-4db3-8fe8-5f3517d1f4c8/0.1.0）
-- **GitHub Release v0.1.1 是 740e8cb5 错 GUID 的包，必须撤下**；替换版 v0.1.4.1（GUID 45a3c083，SHA256 50c97938…fe249，artifact 已验证）因无 GitHub 凭据待发布，本地 tag v0.1.4.1 已建在 7dc74f3（2026-10-04）
+- **GitHub Release v0.1.1（740e8cb5 错 GUID 的包）已于 2026-10-04 撤下**（release 用户手删、远端 tag 已删）；替换版 v0.1.4.1 已发布（tag 在 7dc74f3，GUID 45a3c083，SHA256 50c97938…fe249，发布后下载回验一致）
 - publish_plugin 流程：build_plugin → upload_test_build 拿 artifact_id → publish_plugin(artifact_id, version, changelog, plugin_info)；**首次发布必须先随调用提交 plugin_info**（name/description/author/homepage），否则 400 "Plugin info must be submitted before publishing"
 - Windows 编译/E2E 由用户手动进行（本机 Linux 无法编译 WinUI 文件；用户有 Azure CLI，可临时开 Windows VM），AI 只交付源码改动并等用户回传构建结果，不要自行搭 CI 或开 VM
 - **原生库定位/卸载约束**：稳定宿主 v1.10.2.0 的 GetPluginPath 返回规范绝对目录，热重载可能返回整包复制后的 staging 目录（PluginXamlHost.GetRuntimePath/PrepareResourceRoot）；不能假定 Assembly.Location 可用，也不能搜 PATH；Native/7zip 避开打包时删除 runtimes 的规则；卸载须 await 下载管线退出，确保 COM 对象和 DLL 先释放
