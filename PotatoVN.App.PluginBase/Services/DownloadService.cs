@@ -36,15 +36,32 @@ public class DownloadService : IDisposable
     private const int BufferSize = 81920;
     private static readonly TimeSpan DefaultIdleTimeout = TimeSpan.FromSeconds(60);
 
-    private readonly HttpClient _httpClient;
+    private const int MaxRedirects = 5;           // 手动跟随重定向的最大跳数（自动重定向已关，每跳都要过守卫）
+
+    private readonly HttpClient? _singleClient;   // 测试注入的单一客户端：不做目标守卫与代理降级
+    private readonly Func<bool, HttpMessageHandler>? _handlerFactory; // null = 生产默认 CreateSafeHandler
+    private readonly object _clientsGate = new();
+    private HttpClient? _proxyClient;
+    private HttpClient? _directClient;
     private readonly TimeSpan _idleTimeout;
     private readonly int _chunkSize;
+    private volatile bool _proxyBroken;  // 本实例（=一次下载任务）内共享：代理连不上就降级直连，不再每个连接都撞墙
+    private IWebProxy? _taskProxy;       // 任务开始时快照系统代理：新任务重读设置，改代理不必重启宿主
+    private Action<string>? _log;
 
     /// <summary>瞬时错误的最多尝试次数（测试用）。</summary>
     internal int MaxAttempts { get; init; } = DefaultMaxAttempts;
 
-    public DownloadService() : this(CreateSafeHandler(), DefaultIdleTimeout)
+    /// <summary>代理选择策略（测试用）：null 时用任务快照的系统代理及其绕过列表判定。</summary>
+    internal Func<Uri, bool>? ProxySelector { get; init; }
+
+    /// <summary>目标守卫开关（测试用）：本地回环模拟服务器过不了守卫，纯传输层用例需显式关闭。</summary>
+    internal bool DisableTargetGuard { get; init; }
+
+    public DownloadService()
     {
+        _idleTimeout = DefaultIdleTimeout;
+        _chunkSize = DefaultChunkSize;
     }
 
     /// <summary>自定义传输层、空闲超时与块大小（测试用）。</summary>
@@ -52,42 +69,145 @@ public class DownloadService : IDisposable
     {
         _idleTimeout = idleTimeout;
         _chunkSize = chunkSize;
-        _httpClient = new HttpClient(handler) { Timeout = Timeout.InfiniteTimeSpan };
-        _httpClient.DefaultRequestHeaders.UserAgent.ParseAdd("PotatoVN-PotatoDownload/1.0");
-        _httpClient.DefaultRequestHeaders.AcceptEncoding.ParseAdd("identity"); // 分块按字节偏移落盘，不许服务端压缩
+        _singleClient = CreateClient(handler);
     }
 
-    public void Dispose() => _httpClient.Dispose();
+    /// <summary>传输层工厂（测试用）：true 造代理通道、false 造直连通道；启用目标守卫与代理降级。</summary>
+    internal DownloadService(Func<bool, HttpMessageHandler> handlerFactory, TimeSpan idleTimeout,
+        int chunkSize = DefaultChunkSize)
+    {
+        _idleTimeout = idleTimeout;
+        _chunkSize = chunkSize;
+        _handlerFactory = handlerFactory;
+    }
+
+    private static HttpClient CreateClient(HttpMessageHandler handler)
+    {
+        var client = new HttpClient(handler) { Timeout = Timeout.InfiniteTimeSpan };
+        client.DefaultRequestHeaders.UserAgent.ParseAdd("PotatoVN-PotatoDownload/1.0");
+        client.DefaultRequestHeaders.AcceptEncoding.ParseAdd("identity"); // 分块按字节偏移落盘，不许服务端压缩
+        return client;
+    }
+
+    private HttpClient ClientFor(bool useProxy)
+    {
+        if (_singleClient is not null) return _singleClient;
+        lock (_clientsGate)
+        {
+            var factory = _handlerFactory ?? CreateSafeHandler;
+            return useProxy
+                ? (_proxyClient ??= CreateClient(factory(true)))
+                : (_directClient ??= CreateClient(factory(false)));
+        }
+    }
+
+    public void Dispose()
+    {
+        lock (_clientsGate)
+        {
+            _singleClient?.Dispose();
+            _proxyClient?.Dispose();
+            _directClient?.Dispose();
+        }
+    }
 
     /// <summary>
-    /// 建连时按解析出的 IP 做 SSRF 检查：InstallRequest.Validate 只能看字面主机名，
-    /// 域名解析到内网、以及 HTTP 重定向到内网地址都在这里被拒绝。
+    /// SSRF 守卫分两层：请求层（SendAsync 里校验 RequestUri.Host 的解析结果，每跳重定向都查）对两种
+    /// 通道都生效；直连通道额外在建连回调里「解析+校验+钉住解析结果」，防 DNS 重绑定。
+    /// 走代理时建连端点是代理本身（常为 127.0.0.1）——代理是用户自己的配置，不是 SSRF 目标，
+    /// 绝不能在建连层拦它（issue #1：代理被误判内网导致整功能不可用）。
     /// </summary>
-    private static SocketsHttpHandler CreateSafeHandler() => new()
+    private static SocketsHttpHandler CreateSafeHandler(bool useProxy)
     {
-        ConnectCallback = async (context, ct) =>
+        var handler = new SocketsHttpHandler
         {
-            var host = context.DnsEndPoint.Host;
-            IPAddress[] addresses = IPAddress.TryParse(host, out var literal)
-                ? new[] { literal }
-                : await Dns.GetHostAddressesAsync(host, ct);
-            var allowed = addresses.Where(address => !InstallRequest.IsForbiddenAddress(address)).ToArray();
-            if (allowed.Length == 0)
-                throw new DownloadException($"下载地址指向本机或内网，已拒绝连接: {host}");
+            UseProxy = useProxy,
+            AllowAutoRedirect = false, // 重定向由请求层守卫逐跳校验后手动跟随
+        };
+        if (useProxy)
+        {
+            // 显式快照当前系统代理：HttpClient.DefaultProxy 是进程级缓存，用户改了系统代理
+            // 要重启宿主才生效；这里每个任务读一次，随改随用
+            handler.Proxy = CurrentSystemProxy();
+            return handler;
+        }
+        handler.ConnectCallback = ConnectDirectChecked;
+        return handler;
+    }
 
-            var socket = new Socket(SocketType.Stream, ProtocolType.Tcp) { NoDelay = true };
-            try
-            {
-                await socket.ConnectAsync(allowed, context.DnsEndPoint.Port, ct);
-                return new NetworkStream(socket, ownsSocket: true);
-            }
-            catch
-            {
-                socket.Dispose();
-                throw;
-            }
-        },
-    };
+    /// <summary>直连建连回调：解析、拒绝全禁地址，再钉住解析结果建连（防校验与建连之间的 DNS 重绑定）。</summary>
+    private static async ValueTask<Stream> ConnectDirectChecked(SocketsHttpConnectionContext context, CancellationToken ct)
+    {
+        var host = context.DnsEndPoint.Host;
+        IPAddress[] addresses = IPAddress.TryParse(host, out var literal)
+            ? new[] { literal }
+            : await Dns.GetHostAddressesAsync(host, ct);
+        var allowed = addresses.Where(address => !InstallRequest.IsForbiddenAddress(address)).ToArray();
+        if (allowed.Length == 0)
+            throw new DownloadException($"下载地址指向本机或内网，已拒绝连接: {host}");
+
+        var socket = new Socket(SocketType.Stream, ProtocolType.Tcp) { NoDelay = true };
+        try
+        {
+            await socket.ConnectAsync(allowed, context.DnsEndPoint.Port, ct);
+            return new NetworkStream(socket, ownsSocket: true);
+        }
+        catch
+        {
+            socket.Dispose();
+            throw;
+        }
+    }
+
+    private static IWebProxy? CurrentSystemProxy()
+    {
+        try
+        {
+#pragma warning disable SYSLIB0014 // 唯一能拿到含绕过列表/PAC 的系统代理的 API；WebRequest 本体虽过时，这个入口没有替代品
+            return WebRequest.GetSystemWebProxy();
+#pragma warning restore SYSLIB0014
+        }
+        catch
+        {
+            return null; // 读不到系统代理按直连处理（直连通道自带守卫）
+        }
+    }
+
+    /// <summary>
+    /// 请求层 SSRF 守卫：校验「目标」而非连接端点。字面 IP 与 localhost/.lan 等后缀直接判；
+    /// 域名先解析，全部地址都禁才拒绝（与建连层同语义）。DNS 解析失败抛 SocketException，按瞬时错误重试。
+    /// </summary>
+    internal static async Task EnsureTargetAllowedAsync(Uri uri, CancellationToken ct = default)
+    {
+        var host = uri.Host;
+        IPAddress[] addresses;
+        if (IPAddress.TryParse(host, out var literal))
+        {
+            addresses = [literal];
+        }
+        else
+        {
+            if (InstallRequest.IsPrivateOrLoopbackHost(host))
+                throw new DownloadException($"下载地址指向本机或内网，已拒绝连接: {host}");
+            addresses = await Dns.GetHostAddressesAsync(host, ct);
+        }
+        if (addresses.All(InstallRequest.IsForbiddenAddress))
+            throw new DownloadException($"下载地址指向本机或内网，已拒绝连接: {host}");
+    }
+
+    private bool ShouldUseProxy(Uri uri)
+    {
+        if (_singleClient is not null || _proxyBroken) return false;
+        if (ProxySelector is { } selector) return selector(uri);
+        try
+        {
+            return _taskProxy is not null && !_taskProxy.IsBypassed(uri);
+        }
+        catch
+        {
+            return false; // 代理判定失败时直连：判定都失败多半也用不了，直连通道自带守卫兜底
+        }
+    }
 
     /// <summary>
     /// 下载文件到目标路径（支持断点续传与多线程分块）。
@@ -104,6 +224,9 @@ public class DownloadService : IDisposable
     {
         if (request.IsExpired(DateTimeOffset.Now))
             throw new DownloadException("下载直链已过期，请重新从来源提供方获取链接");
+
+        _log = log;
+        _taskProxy = _singleClient is null && ProxySelector is null ? CurrentSystemProxy() : null;
 
         var totalBytes = (long)request.Size;
         if (File.Exists(targetPath) && new FileInfo(targetPath).Length == totalBytes)
@@ -459,17 +582,99 @@ public class DownloadService : IDisposable
         }
     }
 
+    /// <summary>
+    /// 发送请求：先过请求层 SSRF 守卫，再按系统代理判定走代理/直连；代理连不上自动降级直连重试一次。
+    /// 重定向手动跟随（最多 <see cref="MaxRedirects"/> 跳），每一跳重新校验目标。
+    /// 调用方只拥有首个 request 的所有权；跟随重定向时内部新建的请求由本方法负责释放。
+    /// </summary>
     private async Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken ct)
+    {
+        var owned = false;
+        var redirects = 0;
+        // 测试注入单一传输层时不启用守卫（本地模拟服务器就是 127.0.0.1）
+        var guardEnabled = _singleClient is null && !DisableTargetGuard;
+        while (true)
+        {
+            if (guardEnabled) await EnsureTargetAllowedAsync(request.RequestUri!, ct);
+            HttpResponseMessage response;
+            try
+            {
+                response = await SendOnceAsync(request, ct);
+            }
+            catch
+            {
+                if (owned) request.Dispose();
+                throw;
+            }
+            if (!IsRedirect(response.StatusCode) || response.Headers.Location is not { } location)
+            {
+                if (owned) request.Dispose();
+                return response;
+            }
+            response.Dispose();
+            if (redirects++ >= MaxRedirects)
+            {
+                if (owned) request.Dispose();
+                throw new DownloadException("重定向次数过多，已放弃下载");
+            }
+            var next = new Uri(request.RequestUri!, location);
+            if (next.Scheme != Uri.UriSchemeHttp && next.Scheme != Uri.UriSchemeHttps)
+            {
+                if (owned) request.Dispose();
+                throw new DownloadException($"重定向到不支持的协议: {next.Scheme}");
+            }
+            var followed = CloneRequest(request, next);
+            if (owned) request.Dispose();
+            request = followed;
+            owned = true;
+        }
+    }
+
+    /// <summary>单次发送。代理通道建连失败（MSIX 拦回环代理 / 代理进程已退出）时降级直连并重试。</summary>
+    private async Task<HttpResponseMessage> SendOnceAsync(HttpRequestMessage request, CancellationToken ct)
+    {
+        if (!ShouldUseProxy(request.RequestUri!))
+            return await SendUnwrappingAsync(ClientFor(false), request, ct);
+        try
+        {
+            return await SendUnwrappingAsync(ClientFor(true), request, ct);
+        }
+        catch (HttpRequestException e) when (e.InnerException is SocketException se)
+        {
+            // ResponseHeadersRead 之后的中途失败在读流阶段抛出，到不了这里——这里一定是建连阶段失败。
+            // 典型：MSIX 无回环豁免，连 127.0.0.1:7890 被系统拒绝（AccessDenied，立即返回不会卡）。
+            _proxyBroken = true;
+            _log?.Invoke($"proxy unreachable ({se.SocketErrorCode}), falling back to direct connection");
+            // HttpRequestMessage 不能重复发送，降级重试必须克隆
+            return await SendUnwrappingAsync(ClientFor(false), CloneRequest(request), ct);
+        }
+    }
+
+    private static async Task<HttpResponseMessage> SendUnwrappingAsync(HttpClient client,
+        HttpRequestMessage request, CancellationToken ct)
     {
         try
         {
-            return await _httpClient.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, ct);
+            return await client.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, ct);
         }
         catch (HttpRequestException e) when (e.InnerException is DownloadException rejected)
         {
-            throw rejected; // 建连阶段被 SSRF 检查拒绝：把原因直接抛给用户而不是"发送请求时出错"
+            throw rejected; // 直连建连守卫的拒绝：把原因直接抛给用户而不是"发送请求时出错"
         }
     }
+
+    /// <summary>克隆一个 GET 请求（HttpRequestMessage 发送过一次就不能再发）。下载只发 GET，无正文要处理。</summary>
+    private static HttpRequestMessage CloneRequest(HttpRequestMessage request, Uri? uri = null)
+    {
+        var clone = new HttpRequestMessage(request.Method, uri ?? request.RequestUri);
+        foreach (var header in request.Headers)
+            clone.Headers.TryAddWithoutValidation(header.Key, header.Value);
+        return clone;
+    }
+
+    private static bool IsRedirect(HttpStatusCode code) =>
+        code is HttpStatusCode.Moved or HttpStatusCode.Found or HttpStatusCode.SeeOther
+            or HttpStatusCode.TemporaryRedirect or HttpStatusCode.PermanentRedirect;
 
     private CancellationTokenSource CreateIdleCts(CancellationToken ct)
     {
