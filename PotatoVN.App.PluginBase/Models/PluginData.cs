@@ -1,4 +1,5 @@
 using System.Collections.ObjectModel;
+using System.Text.Json.Serialization;
 using CommunityToolkit.Mvvm.ComponentModel;
 
 namespace PotatoVN.App.PluginBase.Models;
@@ -21,6 +22,11 @@ public partial class PluginData : ObservableRecipient
     /// <summary>下载完成后是否自动解压并入库；关闭时只把压缩包保留在下载目录，由用户自己解压</summary>
     [ObservableProperty] private bool _autoUnpack = true;
 
-    /// <summary>下载历史（最新在前，最多保留 50 条）</summary>
-    public ObservableCollection<DownloadRecord> History { get; } = [];
+    /// <summary>
+    /// 下载历史（最新在前，最多保留 50 条）。
+    /// [JsonInclude]+private set 是必须的：STJ 默认不填充 get-only 集合（静默丢弃整个 History），
+    /// 有 setter 才会在反序列化时替换实例。
+    /// </summary>
+    [JsonInclude]
+    public ObservableCollection<DownloadRecord> History { get; private set; } = [];
 }

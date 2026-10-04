@@ -32,6 +32,7 @@ internal static class Program
         try
         {
             CheckValidation();
+            CheckPluginDataRoundTrip();
             ProgressDisplayChecks.Run(Check);
             await CheckDownloadsAsync();
             await DownloadTuningChecks.RunAsync(Root, Check);
@@ -123,6 +124,26 @@ internal static class Program
         var redacted = InstallRequest.RedactForLog(uri);
         Check(!redacted.Contains("SECRET") && !redacted.Contains("pw123") && redacted.Contains("title=CLANNAD") && redacted.Contains("url=<redacted>"), $"redact: {redacted}");
         Check(parsed.DeduplicationKey.Contains('\u001f'), "dedupe key: fields separated by U+001F");
+    }
+
+    /// <summary>持久化回归：get-only 集合曾被 STJ 默认选项静默丢弃，重启后历史清空。</summary>
+    private static void CheckPluginDataRoundTrip()
+    {
+        var data = new PluginData { DownloadPath = @"D:\Games", AutoDownload = true, AutoUnpack = false };
+        data.History.Add(new DownloadRecord
+        {
+            Title = "CLANNAD",
+            Size = 123456789,
+            Outcome = DownloadRecord.OutcomeCompleted,
+            Message = "done",
+            FinishedAt = DateTimeOffset.Now,
+        });
+        var json = System.Text.Json.JsonSerializer.Serialize(data);
+        var back = System.Text.Json.JsonSerializer.Deserialize<PluginData>(json);
+        Check(back is not null && back.History.Count == 1 && back.History[0].Title == "CLANNAD"
+            && back.History[0].Size == 123456789
+            && back.DownloadPath == @"D:\Games" && back.AutoDownload && !back.AutoUnpack,
+            "persist: PluginData json round-trip keeps history and settings");
     }
 
     // ---------------------------------------------------------------- DownloadService

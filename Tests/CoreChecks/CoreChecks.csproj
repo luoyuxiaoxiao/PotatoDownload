@@ -12,6 +12,7 @@
   <ItemGroup>
     <Compile Include="../../PotatoVN.App.PluginBase/Models/InstallRequest.cs" Link="Plugin/InstallRequest.cs" />
     <Compile Include="../../PotatoVN.App.PluginBase/Models/DownloadRecord.cs" Link="Plugin/DownloadRecord.cs" />
+    <Compile Include="../../PotatoVN.App.PluginBase/Models/PluginData.cs" Link="Plugin/PluginData.cs" />
     <Compile Include="../../PotatoVN.App.PluginBase/Models/UnpackProgress.cs" Link="Plugin/UnpackProgress.cs" />
     <Compile Include="../../PotatoVN.App.PluginBase/Helper/TransferProgressDisplay.cs" Link="Plugin/TransferProgressDisplay.cs" />
     <Compile Include="../../PotatoVN.App.PluginBase/Services/DownloadService.cs" Link="Plugin/DownloadService.cs" />
@@ -23,6 +24,7 @@
   </ItemGroup>
   <ItemGroup>
     <PackageReference Include="Blake3.Managed" Version="1.5.2" />
+    <PackageReference Include="CommunityToolkit.Mvvm" Version="8.4.0" />
     <PackageReference Include="SharpCompress" Version="0.50.4" />
   </ItemGroup>
 </Project>
