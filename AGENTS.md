@@ -104,6 +104,9 @@
 - 公共 base64 echo 端点只有 `httpbingo.org/base64/{base64url}` 字节级可靠（2026-09 实测 sha256 完全一致）；httpbin.org 的 /base64 对含 `+`/`/` 的标准 base64 一律 404（百分号编码也不行）——构造测试下载地址别用 httpbin
 - **插件 UI 禁用 XAML，一律纯 C#**：插件 XAML 依赖宿主 v1.10.1+ 的 PluginXamlHost（注册插件 IXamlMetadataProvider + ms-appx 绝对路径 LoadComponent），旧宿主 CreateSettingUi 直接 XamlParseException（2026-09 用户实测崩溃）；不要调用 ResourceLoader.Initialize/加载 Styles 字典；C# 取主题资源用 PluginTheme（ResourceDictionary.TryGetValue 不进 ThemeDictionaries，需递归且必须带回退值）
 - **pull 真分歧冲突的解法（2026-09-14 实证，a953359）**：平台会话与本地会话并行向 main 提交同一功能的两套实现（本地 6bce3c1 暂停/继续+心跳 vs 远端 3b228e3+2d112e7 完整重写）时，先 `git show :1/:2/:3` 抽三阶段对比——远端重写版通常是本地工作的严格超集（心跳/图标按钮/暂停继续都已含更完善形态），确认后整个冲突文件取 theirs，别逐 hunk 手拼；验收标准：`git diff origin/main --stat` 为空（合并树与远端逐字节一致、本地无遗失），CoreChecks + build_plugin 全绿再提交
+- **issue #1 修法（方案 C，2026-10-04）**：SSRF 守卫分两层——请求层 `EnsureTargetAllowedAsync` 查 RequestUri.Host（字面/内网后缀/DNS 解析，每跳重定向都查；自动重定向已关，手动跟 ≤5 跳），直连 ConnectCallback 保留"解析+校验+钉住"防 DNS 重绑定；代理端点是用户配置不是目标，永不拦它。代理建连失败（MSIX 拦回环 = SocketException AccessDenied 10013，秒 fail-fast）自动降级直连（实例级 `_proxyBroken`，新任务自动重试代理）；系统代理每任务经 `WebRequest.GetSystemWebProxy()` 快照——`HttpClient.DefaultProxy` 进程级缓存是"改代理要重启宿主"的根因
+- **文件夹选择不能用 Windows.Storage.Pickers.***：MSIX 打包宿主里静默不弹窗（宿主 PvnFsPicker 手搓 COM 即因此）；Microsoft.Windows.Storage.Pickers 需宿主 WinAppSDK≥1.8 运行时（稳定版不保证）。插件用 `Helper/FolderPickerDialog.cs`（COM IFileOpenDialog+FOS_PICKFOLDERS，vtable 必须全序声明），owner HWND = `WinRT.Interop.WindowNative.GetWindowHandle(HostApi.GetMainWindow())`；UI 线程（STA）同步调即可（模态框自泵消息）
+- **FontIcon 字形等 PUA 字符别直接写进源码**：file_editor 会把 `\uE8B7` 这类转义落成原始字符、二次编辑匹配困难；写 `((char)0xE8B7).ToString()` 纯 ASCII 形式（2026-10-04 实证）
 
 ### References
 <!-- 外部资源指针。例：- 报错日志查 Grafana: grafana.internal/d/plugin-runtime -->
