@@ -75,6 +75,7 @@
 ### Feedback / Lessons
 <!-- 用户纠正过的做法 + 原因。例：- 不要 mock 数据库测试，原因：上次 mock 通过但生产迁移失败 -->
 - 仓库根必须有 NuGet.Config（globalPackagesFolder=C:\pvn-vibe\nuget-cache），否则 terminal restore 与 MCP build 缓存分裂（新包 MCP 找不到）
+- **origin remote 里的 ghs_ 安装令牌约 1h 过期（2026-10-04 实证）**：过期后 push 和 GitHub Release API 全部 401；且 MCP git_commit_and_push 失败路径会把 token 从 remote URL 剥离（set-url 成无凭据 URL），凭证管理器无缓存（GCM 交互被禁）。恢复方式：link_github_repo 带新 token，或新开会话让平台重新 stamp；恢复前本地的 commit 都发不出去，GitHub Release 也无法改
 - 插件 csproj 必须含模板的 PackPlugin/_StampPluginNamespace target 才能产出 artifacts/plugin.pvnplugin.zip；模板在 C:\pvn-vibe\plugin-base
 - 模板 csproj 无 ImplicitUsings，新 .cs 文件需手写 using System/IO/Linq/Net.Http 等
 - 带 BOM 的 .cs 文件 file_editor 会误判为二进制，用 PowerShell ReadAllText 确认内容
