@@ -1,5 +1,8 @@
 {     
   "SettingTitle": "設定",
   "SettingDescription": "設定の説明",
-  "Login": "ログイン"
+  "Login": "ログイン",
+  "Settings_BrowseFolder": "ダウンロード先を選択",
+  "Settings_AutoUnpack_Title": "ダウンロード後に自動解凍",
+  "Settings_AutoUnpack_Description": "オン：完了後に自動で解凍してライブラリに登録。オフ：アーカイブのみ保存し、手動で解凍"
 }

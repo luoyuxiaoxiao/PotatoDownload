@@ -1,5 +1,8 @@
 {
   "SettingTitle": "设置标题",
   "SettingDescription": "设置描述",
-  "Login": "登录"
+  "Login": "登录",
+  "Settings_BrowseFolder": "选择下载目录",
+  "Settings_AutoUnpack_Title": "下载后自动解压",
+  "Settings_AutoUnpack_Description": "开启：下载完成后自动解压并入库；关闭：只保留压缩包，由你手动解压"
 }

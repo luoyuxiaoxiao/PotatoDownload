@@ -1,5 +1,8 @@
 {
   "SettingTitle": "Setting Title",
   "SettingDescription": "Setting Description",
-  "Login": "Login"
+  "Login": "Login",
+  "Settings_BrowseFolder": "Choose download folder",
+  "Settings_AutoUnpack_Title": "Unpack automatically after download",
+  "Settings_AutoUnpack_Description": "On: unpack and import into the library after download. Off: keep the archive only and unpack it yourself."
 }

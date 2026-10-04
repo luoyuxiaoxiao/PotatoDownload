@@ -102,6 +102,9 @@ namespace PotatoVN.App.PluginBase
         internal static System.Collections.ObjectModel.ObservableCollection<DownloadRecord> HistoryCollection =>
             PluginDataInstance.History;
 
+        /// <summary>下载完成后是否自动解压并入库；关闭时只保留压缩包。</summary>
+        internal static bool AutoUnpack => PluginDataInstance.AutoUnpack;
+
         /// <summary>立即保存插件数据（用于历史记录等不触发 PropertyChanged 的修改）。</summary>
         internal static void SaveDataNow()
         {

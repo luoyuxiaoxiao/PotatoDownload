@@ -18,6 +18,9 @@ public partial class PluginData : ObservableRecipient
     /// <summary>收到推送后是否自动开始下载；关闭时弹出确认框，用户点击「下载」后才开始</summary>
     [ObservableProperty] private bool _autoDownload = false;
 
+    /// <summary>下载完成后是否自动解压并入库；关闭时只把压缩包保留在下载目录，由用户自己解压</summary>
+    [ObservableProperty] private bool _autoUnpack = true;
+
     /// <summary>下载历史（最新在前，最多保留 50 条）</summary>
     public ObservableCollection<DownloadRecord> History { get; } = [];
 }

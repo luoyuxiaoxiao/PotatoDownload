@@ -371,6 +371,19 @@ public class DownloadManager
                 throw;
             }
 
+            // 3.5 只下载不解压（用户在设置里关了自动解压）：压缩包挪出暂存子目录留给用户自己处理
+            if (!Plugin.AutoUnpack)
+            {
+                var keepPath = ResolveArchiveKeepPath(downloadDir, task.Request.FileName);
+                task.PackPath = null; // 先摘清再挪：此后压缩包是用户的文件，取消清理逻辑绝不再碰它
+                File.Move(packPath, keepPath);
+                task.Message = "已下载（按设置跳过解压与入库）";
+                task.Stage = DownloadTaskStage.Completed;
+                RecordHistory(task, DownloadRecord.OutcomeCompleted);
+                _hostApi.Info(InfoBarSeverity.Success, "PotatoDownload", $"完成: {task.Title}");
+                return;
+            }
+
             // 4. 解压：目录名来自压缩包内容，落在下载目录内；不删除任何不是本插件创建的目录
             task.Message = "正在读取压缩包…";
             task.Stage = DownloadTaskStage.Unpacking;
@@ -411,6 +424,17 @@ public class DownloadManager
         {
             _hostApi.InvokeOnMainThread(BumpActiveCount);
         }
+    }
+
+    /// <summary>压缩包的保留位置：放在下载目录根；与既有文件/目录撞名时追加" (n)"后缀，绝不覆盖用户文件。</summary>
+    private static string ResolveArchiveKeepPath(string downloadDir, string fileName)
+    {
+        var candidate = Path.Combine(downloadDir, fileName);
+        var stem = Path.GetFileNameWithoutExtension(fileName);
+        var extension = Path.GetExtension(fileName);
+        for (var suffix = 2; File.Exists(candidate) || Directory.Exists(candidate); suffix++)
+            candidate = Path.Combine(downloadDir, $"{stem} ({suffix}){extension}");
+        return candidate;
     }
 
     /// <summary>把完成/失败的任务写入持久化历史（最新在前，最多保留 MaxHistoryCount 条）。</summary>
