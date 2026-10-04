@@ -51,6 +51,7 @@
 
 ### User Preferences
 <!-- 用户偏好与约定。例：- 提交信息一律使用中文 -->
+- **GitHub issue 不自动回评论、不自动关单**（2026-10-04 用户明确要求，issue #1 被回评后被 reopen）：不在 issue/PR 下发评论；commit message 不用 fixes/close 等自动关单关键词；是否解决由用户验证后自行决定
 
 ### Project Facts
 <!-- 架构、依赖、外部系统、为什么这么做。例：- 编译目标 net8.0-windows，原因：宿主 PotatoVN 限定 -->
