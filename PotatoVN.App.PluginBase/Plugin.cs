@@ -25,7 +25,7 @@ namespace PotatoVN.App.PluginBase
         
         public PluginInfo Info { get; } = new()
         {
-            Id = new Guid("45a3c083-f22a-484f-8dcb-bef1bfd3c076"), 
+            Id = new Guid("740e8cb5-5cb8-46bc-b9e8-38e178805e5c"), 
             Name = "PotatoDownload",
             Description = "从 shionlib 自动推送到 PotatoVN 进行下载、解压和刮削。",
         };

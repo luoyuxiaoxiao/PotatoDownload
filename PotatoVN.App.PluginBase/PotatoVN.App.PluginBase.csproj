@@ -10,7 +10,7 @@
     <EnableCoreFrameworkTracking>false</EnableCoreFrameworkTracking>
     <!--TODO：请务必修改AssemblyName你的插件Id一致，避免和其他插件冲突-->
     <!--TODO：命名规则A{id}，如A78f4ca27-7ffb-43b2-a5a5-111111db096d-->
-    <AssemblyName>A45a3c083f22a484f8dcbbef1bfd3c076</AssemblyName>
+    <AssemblyName>A740e8cb55cb846bcb9e838e178805e5c</AssemblyName>
     <!-- 要处理该警告需要用到.Net Preview的特性，等特性稳定（进入正式版）后再处理 -->
     <NoWarn>MVVMTK0045</NoWarn>
   </PropertyGroup>
