@@ -66,7 +66,7 @@
 - UI：侧边栏按钮"下载"→ ContentDialog 弹窗（DownloadProgressDialog，纯C#，Chrome 风格：进行中+历史记录两区，行内暂停/继续/取消图标按钮），无独立页面；设置页 UserControl1（纯C#）；主题资源查找走 Helper/PluginTheme。DownloadTask 是普通轮询模型（不是 ObservableObject）：下载写 Received（Interlocked），解压发布不可变字节快照；面板每 500ms 轮询、三秒滑窗算速度，重建复用活动行保留采样；百分比向下保留一位、进行中最多 99.9%，未知总量/校验/入库用不定进度；暂停记住原阶段，不能拿下载满进度冒充解压进度
 - 交互语义：自动下载 ON=立即下载并自动弹下载面板；OFF=弹"确认下载"ContentDialog；**全部弹窗（确认/下载面板）经 Plugin_Ui 的 EnqueueDialog 串行协调器**——ContentDialog 同时只能开一个，各自 ShowAsync 会撞车静默吞请求（2026-09 远程报错实证）；推送到达自动弹面板是**宿主 DefaultActivationHandler 导航不可抑制**的替代方案（插件 API 无法阻止跳起始页）
 - 断点续传坑：.part+水位在失败中断后会残留；DownloadAsync 开头对"水位与文件大小都达预期"的 .part 直接复用跳过下载；DownloadSequentialAsync 里 committed>0 但响应不是 206（服务端忽略 Range 整包返回）必须清零从头覆盖，否则重复追加成 2 倍大小（2026-09 实测 363→726）
-- 下载历史持久化在 PluginData.History（get-only ObservableCollection，STJ 可 populate；集合变更不触发 PropertyChanged，需 Plugin.SaveDataNow() 手动保存）；侧边栏按钮状态切换靠 Unregister+Register（宿主无原地更新接口）
+- 下载历史持久化在 PluginData.History（[JsonInclude]+private set 的 ObservableCollection——STJ 默认**不**填充 get-only 集合，见 Feedback 区实证；集合变更不触发 PropertyChanged，需 Plugin.SaveDataNow() 手动保存）；侧边栏按钮状态切换靠 Unregister+Register（宿主无原地更新接口）
 - DevReportInfo 自 v0.1.0 起为空实现（plan/main 一致）；需要远程诊断时临时恢复上报，发布前改回
 - 测验网站：repo/docs/index.html，GitHub Pages 从 plan 分支 /docs 发布（https://luoyuxiaoxiao.github.io/PotatoDownload/，**docs/.nojekyll 必须保留**——没有它 Jekyll 构建直接失败 2026-09-13 实证；Pages 支持 Range 回 206，构建约 1 分钟），也可 file:// 直开；构链/触发逻辑逐字移植 Shionlib helpers/{protocol,potatovn}.ts（URLSearchParams 编码 + 隐藏 a 点击 + 可调"签名等待"延时），**移植段不要改**，测试开关（provider 覆盖/缺参/不校验/密码/格式覆盖）只在 buildInstallUrl 包装层（等价性自检 `Tests/SiteCheck/check.ts`，deno 对照本机 Shionlib 克隆逐字节比对，改页面构链后必跑）；载荷 docs/payload/test_game.zip 经 Pages 公网直链下发（SSRF 修复后本地服务器不可用），改载荷后跑 make-payload.ps1 并更新页面 PAYLOAD 常量；宿主侧安装入口：插件页"从本地压缩包安装"（AddPluginFromLocalZip）
 - 插件内推送测试（侧边栏按钮/TestPushDialog/Helper/TestPush.cs）已于 2026-09-13 移除，测验统一走 docs 网站，发布前不再需要删测试代码
@@ -75,6 +75,7 @@
 
 ### Feedback / Lessons
 <!-- 用户纠正过的做法 + 原因。例：- 不要 mock 数据库测试，原因：上次 mock 通过但生产迁移失败 -->
+- **STJ 默认不填充 get-only 集合属性**（2026-10-04 实证：默认选项下 round-trip 后 History=0 条，不抛异常静默丢弃；这是"重启后下载历史消失"的根因——标量设置有 setter 所以正常持久化，只有集合丢）。修法二选一：属性加 [JsonInclude]+private set（已采用，模型自带正确性），或调用点传 JsonObjectCreationHandling.Populate。回归用例已入 CoreChecks（CheckPluginDataRoundTrip，链接真实 PluginData.cs + CommunityToolkit.Mvvm 8.4.0）。此前记忆"STJ 可 populate"是错的
 - 仓库根必须有 NuGet.Config（globalPackagesFolder=C:\pvn-vibe\nuget-cache），否则 terminal restore 与 MCP build 缓存分裂（新包 MCP 找不到）
 - **origin remote 里的 ghs_ 安装令牌约 1h 过期（2026-10-04 实证）**：过期后 push 和 GitHub Release API 全部 401；且 MCP git_commit_and_push 失败路径会把 token 从 remote URL 剥离（set-url 成无凭据 URL），凭证管理器无缓存（GCM 交互被禁）。**恢复方式只有 link_github_repo 带用户提供的 PAT——新开会话不会重新 stamp**（2026-10-04 二次实证：新会话里 link_github_repo 不传 token 返回 has_token:false，MCP push 只沿用现有无凭据 URL 直接 401）；恢复前本地 commit 发不出去、GitHub Release 无法改。**link_github_repo 带 PAT 绑定后 token 只存平台侧，不会注入本地 remote URL**，需手动 `git remote set-url origin https://x-access-token:<pat>@github.com/...` 才能 push；REST API 用 `Authorization: Bearer <pat>`（2026-10-04 实证全通）
 - 插件 csproj 必须含模板的 PackPlugin/_StampPluginNamespace target 才能产出 artifacts/plugin.pvnplugin.zip；模板在 C:\pvn-vibe\plugin-base
