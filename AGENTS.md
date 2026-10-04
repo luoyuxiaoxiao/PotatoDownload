@@ -115,6 +115,7 @@
 - 本插件远程仓库：github.com/luoyuxiaoxiao/PotatoDownload（main 与 plan 均已推送；用户明确要求 push 到 main）
 - **分支分工（用户约定）：plan=开发线，main=发布线**；2026-09-13 起两分支插件代码一致（插件内测试功能已移除，DevReportInfo 空实现），plan 额外承载 docs/ 测验网站并作为 GitHub Pages 发布源；v0.1.0 已发布到应用市场（tag v0.1.0，包页 plugin.api.potatovn.net/pvn-plugin/package/dfb57882-7b2f-4db3-8fe8-5f3517d1f4c8/0.1.0）
 - **GitHub Release v0.1.1（740e8cb5 错 GUID 的包）已于 2026-10-04 撤下**（release 用户手删、远端 tag 已删）；替换版 v0.1.4.1 已发布（tag 在 7dc74f3，GUID 45a3c083，SHA256 50c97938…fe249，发布后下载回验一致）
+- **v0.1.5 已发 GitHub Release、未发市场**（2026-10-04 用户要求暂不发布）：main=fe93a3c（plan 已 FF 合入），SHA256 1d8f0164…5450；内容=issue #1 SSRF 代理修复 + 浏览按钮 + 自动解压开关；issue #1 因 37d209e 的 fixes 关键词在合入 main 时自动关单（用户已接受）
 - publish_plugin 流程：build_plugin → upload_test_build 拿 artifact_id → publish_plugin(artifact_id, version, changelog, plugin_info)；**首次发布必须先随调用提交 plugin_info**（name/description/author/homepage），否则 400 "Plugin info must be submitted before publishing"
 - Windows 编译/E2E 由用户手动进行（本机 Linux 无法编译 WinUI 文件；用户有 Azure CLI，可临时开 Windows VM），AI 只交付源码改动并等用户回传构建结果，不要自行搭 CI 或开 VM
 - **原生库定位/卸载约束**：稳定宿主 v1.10.2.0 的 GetPluginPath 返回规范绝对目录，热重载可能返回整包复制后的 staging 目录（PluginXamlHost.GetRuntimePath/PrepareResourceRoot）；不能假定 Assembly.Location 可用，也不能搜 PATH；Native/7zip 避开打包时删除 runtimes 的规则；卸载须 await 下载管线退出，确保 COM 对象和 DLL 先释放
