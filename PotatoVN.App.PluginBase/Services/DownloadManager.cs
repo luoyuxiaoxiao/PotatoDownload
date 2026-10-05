@@ -270,6 +270,7 @@ public class DownloadManager
                 TryDeleteFile(packPath);
                 TryDeleteFile(packPath + ".part");
                 TryDeleteFile(packPath + ".part.watermark");
+                TryDeleteFile(RequestSidecarPath(packPath));
             }
         }
         catch (Exception e)
@@ -306,6 +307,12 @@ public class DownloadManager
                     return;
                 }
                 var task = new DownloadTask(request);
+                // 续传现场的请求快照：排队/下载中主程序退出后，下次启动据此还原为可继续的任务。
+                // PackPath 也在这里确定，排队中被取消时清理逻辑才能找到 sidecar/.part。
+                var packPath = StagingPackPath(ResolveDownloadDir(), request.FileName);
+                Directory.CreateDirectory(Path.GetDirectoryName(packPath)!);
+                task.PackPath = packPath;
+                WriteRequestSidecar(packPath, request);
                 Tasks.Add(task);
                 BumpActiveCount();
                 added.TrySetResult(task);
@@ -335,12 +342,10 @@ public class DownloadManager
         {
             // 1. 下载目录：设置项，或系统盘 Galgame 文件夹（自动创建）。
             //    压缩包与 .part 放在专属子目录：下载目录里可能有用户自己的同名压缩包，绝不能覆盖或删除它
-            var downloadDir = string.IsNullOrWhiteSpace(Plugin.DownloadPath)
-                ? Plugin.DefaultDownloadPath
-                : Plugin.DownloadPath;
+            var downloadDir = ResolveDownloadDir();
             var stagingDir = Path.Combine(downloadDir, ".potatodownload");
             Directory.CreateDirectory(stagingDir);
-            var packPath = Path.Combine(stagingDir, task.Request.FileName);
+            var packPath = StagingPackPath(downloadDir, task.Request.FileName);
             task.PackPath = packPath;
 
             // 2. 下载（多线程分块 + 断点续传）。每次网络读取都更新 Received；速度由面板按采样周期计算。
@@ -368,6 +373,7 @@ public class DownloadManager
             catch (DownloadException)
             {
                 File.Delete(packPath);
+                TryDeleteFile(RequestSidecarPath(packPath));
                 throw;
             }
 
@@ -377,6 +383,7 @@ public class DownloadManager
                 var keepPath = ResolveArchiveKeepPath(downloadDir, task.Request.FileName);
                 task.PackPath = null; // 先摘清再挪：此后压缩包是用户的文件，取消清理逻辑绝不再碰它
                 File.Move(packPath, keepPath);
+                TryDeleteFile(RequestSidecarPath(packPath));
                 task.Message = "已下载（按设置跳过解压与入库）";
                 task.Stage = DownloadTaskStage.Completed;
                 RecordHistory(task, DownloadRecord.OutcomeCompleted);
@@ -414,6 +421,7 @@ public class DownloadManager
 
             // 6. 清理压缩包
             File.Delete(packPath);
+            TryDeleteFile(RequestSidecarPath(packPath));
 
             task.Message = "完成";
             task.Stage = DownloadTaskStage.Completed;
@@ -446,6 +454,126 @@ public class DownloadManager
         for (var suffix = 2; File.Exists(candidate) || Directory.Exists(candidate); suffix++)
             candidate = Path.Combine(downloadDir, $"{stem} ({suffix}){extension}");
         return candidate;
+    }
+
+    /// <summary>生效的下载目录：设置项，或系统盘 Galgame 文件夹。</summary>
+    private static string ResolveDownloadDir() =>
+        string.IsNullOrWhiteSpace(Plugin.DownloadPath) ? Plugin.DefaultDownloadPath : Plugin.DownloadPath;
+
+    /// <summary>压缩包的暂存路径：下载目录下的 .potatodownload 子目录。</summary>
+    private static string StagingPackPath(string downloadDir, string fileName) =>
+        Path.Combine(Path.Combine(downloadDir, ".potatodownload"), fileName);
+
+    /// <summary>续传现场的请求快照路径：与 .part/水位放在一起，主程序重启后据此还原中断的任务。</summary>
+    internal static string RequestSidecarPath(string packPath) => packPath + ".request.json";
+
+    /// <summary>
+    /// 把请求快照写进暂存目录（含签名直链——只落在用户本机，敏感度等同浏览器下载记录）。
+    /// 写失败只影响重启后的还原，不阻断下载本身。
+    /// </summary>
+    private void WriteRequestSidecar(string packPath, InstallRequest request)
+    {
+        try
+        {
+            File.WriteAllText(RequestSidecarPath(packPath), System.Text.Json.JsonSerializer.Serialize(request));
+        }
+        catch (Exception e)
+        {
+            _hostApi.Log(InfoBarSeverity.Warning,
+                $"PotatoDownload: write resume sidecar failed ({request.Title}): {e.Message}");
+        }
+    }
+
+    /// <summary>
+    /// 启动时还原被主程序退出打断的下载：直链未过期的恢复为"已暂停"（可继续/取消，进度按水位还原）；
+    /// 已过期的无法续传，清理残留并在历史记录里说明，用户重新推送即可。
+    /// 任务列表只能在主线程增删；必须在推送服务启动前调用，让去重能看到还原出的任务。
+    /// </summary>
+    public async Task RestoreInterruptedTasks()
+    {
+        var stagingDir = Path.Combine(ResolveDownloadDir(), ".potatodownload");
+        if (!Directory.Exists(stagingDir)) return;
+        foreach (var sidecar in Directory.GetFiles(stagingDir, "*.request.json"))
+        {
+            try
+            {
+                InstallRequest? request;
+                try
+                {
+                    request = System.Text.Json.JsonSerializer.Deserialize<InstallRequest>(
+                        await File.ReadAllTextAsync(sidecar));
+                }
+                catch (System.Text.Json.JsonException e)
+                {
+                    // 快照损坏（写一半时进程被杀等）：没法还原，清掉避免每次启动都报错
+                    TryDeleteFile(sidecar);
+                    _hostApi.Log(InfoBarSeverity.Warning,
+                        $"PotatoDownload: broken resume sidecar removed ({Path.GetFileName(sidecar)}): {e.Message}");
+                    continue;
+                }
+                if (request is null || string.IsNullOrEmpty(request.FileName))
+                {
+                    TryDeleteFile(sidecar);
+                    continue;
+                }
+                var packPath = Path.Combine(stagingDir, request.FileName);
+                if (request.IsExpired(DateTimeOffset.Now))
+                {
+                    TryDeleteFile(packPath);
+                    TryDeleteFile(packPath + ".part");
+                    TryDeleteFile(packPath + ".part.watermark");
+                    TryDeleteFile(sidecar);
+                    RecordHistory(new DownloadTask(request) { Message = "下载链接已过期，请从网站重新推送" },
+                        DownloadRecord.OutcomeFailed);
+                    continue;
+                }
+                var task = new DownloadTask(request)
+                {
+                    PackPath = packPath,
+                    Received = RestoreReceived(packPath, request),
+                    PausedFromStage = DownloadTaskStage.Downloading,
+                    Message = "已暂停（主程序已退出，可继续）",
+                    Stage = DownloadTaskStage.Paused,
+                };
+                var added = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+                _hostApi.InvokeOnMainThread(() =>
+                {
+                    try
+                    {
+                        Tasks.Add(task);
+                        BumpActiveCount();
+                        added.TrySetResult();
+                    }
+                    catch (Exception e)
+                    {
+                        added.TrySetException(e);
+                    }
+                });
+                await added.Task;
+            }
+            catch (Exception e)
+            {
+                _hostApi.Log(InfoBarSeverity.Warning,
+                    $"PotatoDownload: restore interrupted task failed ({Path.GetFileName(sidecar)}): {e.Message}");
+            }
+        }
+    }
+
+    /// <summary>还原进度：包已下完（中断在校验/解压/入库）按满进度；否则按水位（从头连续已写字节）。</summary>
+    private static long RestoreReceived(string packPath, InstallRequest request)
+    {
+        try
+        {
+            if (File.Exists(packPath)) return (long)request.Size;
+            if (File.Exists(packPath + ".part.watermark") &&
+                long.TryParse(File.ReadAllText(packPath + ".part.watermark"), out var watermark) && watermark > 0)
+                return Math.Min(watermark, (long)request.Size);
+        }
+        catch
+        {
+            // 读不到就按 0 处理，续传时下载层会自己再核对水位
+        }
+        return 0;
     }
 
     /// <summary>把完成/失败的任务写入持久化历史（最新在前，最多保留 MaxHistoryCount 条）。</summary>

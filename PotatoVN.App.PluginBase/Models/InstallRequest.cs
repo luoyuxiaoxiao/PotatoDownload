@@ -3,6 +3,7 @@ using System.IO;
 using System.Linq;
 using System.Net;
 using System.Net.Sockets;
+using System.Text.Json.Serialization;
 using System.Text.RegularExpressions;
 
 namespace PotatoVN.App.PluginBase.Models;
@@ -51,6 +52,7 @@ public class InstallRequest
     public string Title { get; init; } = string.Empty;
 
     /// <summary>去重键：同一 provider + resource_id + checksum + url 视为同一次推送。</summary>
+    [JsonIgnore] // 由其它字段计算，不进 JSON（续传现场的请求快照落盘用）
     public string DeduplicationKey => $"{Provider}\u001f{ResourceId}\u001f{Checksum ?? string.Empty}\u001f{Url}";
 
     public static InstallRequest Parse(Uri uri)

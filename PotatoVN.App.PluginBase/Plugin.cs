@@ -62,6 +62,15 @@ namespace PotatoVN.App.PluginBase
 
             DownloadManager = new DownloadManager(_hostApi);
             DownloadManager.ActiveTaskCountChanged += count => UpdateDownloadSidebarState(count);
+            try
+            {
+                // 还原上次被主程序退出打断的下载（在推送服务启动前，保证去重能看到这些任务）
+                await DownloadManager.RestoreInterruptedTasks();
+            }
+            catch (Exception e)
+            {
+                await DevReportInfo(e, "restore interrupted downloads failed");
+            }
             _pushService = new PushService(_hostApi, DevReportInfo);
             _pushService.RequestReceived += OnPushRequestReceived;
             _pushService.Start();

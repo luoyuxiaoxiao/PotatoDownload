@@ -39,6 +39,7 @@ internal static class Program
             await CheckUnpackAsync();
             await UnpackProgressChecks.RunAsync(Root, Check);
             await CheckManagerAsync();
+            await CheckRestoreAsync();
         }
         finally
         {
@@ -615,7 +616,8 @@ internal static class Program
         Check(File.Exists(Path.Combine(downloadDir, "Game", "game.exe"))
               && !File.Exists(Path.Combine(downloadDir, "Game", "Game", "game.exe"))
               && !File.Exists(Path.Combine(downloadDir, "Game", UnpackService.IncompleteMarker)), "manager: game extracted and marked complete");
-        Check(!File.Exists(pack) && !PartExists(), "manager: staging archive removed after import");
+        Check(!File.Exists(pack) && !PartExists() && !File.Exists(pack + ".request.json"),
+            "manager: staging archive and resume sidecar removed after import");
         Check(Plugin.HistoryCollection.Count == 1 && Plugin.HistoryCollection[0].Outcome == DownloadRecord.OutcomeCompleted,
             "manager: history records the completion");
 
@@ -636,6 +638,7 @@ internal static class Program
         await run3;
         Check(t3.Stage == DownloadTaskStage.Paused && t3.PausedFromStage == DownloadTaskStage.Downloading && PartExists(),
             $"manager: pause keeps the .part and the previous progress stage ({t3.Stage}, part exists: {PartExists()})");
+        Check(File.Exists(pack + ".request.json"), "manager: paused task keeps the resume sidecar");
         Check(manager.HasActiveTask(t3.Request.DeduplicationKey), "manager: a paused task still blocks a duplicate push");
         manager.ResumeTask(t3);
         await WaitUntilAsync(() => t3.IsListed ? null : t3, "resumed task to finish", 90000);
@@ -694,6 +697,56 @@ internal static class Program
         Check(Directory.GetDirectories(downloadDir).Length == dirsBefore,
             "manager: auto-unpack off creates no game directory");
         Plugin.AutoUnpack = true;
+    }
+
+    // ---------------------------------------------------------------- 中断任务还原
+
+    private static async Task CheckRestoreAsync()
+    {
+        // 主程序退出打断的下载：未过期的还原为可继续的暂停任务（进度按水位），已过期的清理并记历史
+        var dir = Path.Combine(Root, "restore");
+        var downloadDir = Path.Combine(dir, "downloads");
+        var staging = Path.Combine(downloadDir, ".potatodownload");
+        Directory.CreateDirectory(staging);
+        Plugin.DownloadPath = downloadDir;
+        var historyBefore = Plugin.HistoryCollection.Count;
+
+        InstallRequest RestoreReq(string id, string file, long expires) => new()
+        {
+            V = 1, Provider = "shionlib", ResourceId = id, Url = "https://dl.example.com/" + id,
+            FileName = file, ArchiveFormat = "zip", Size = 1000, BgmId = "13", Title = "T-" + id,
+            ChecksumAlgo = "sha256", Checksum = new string('a', 64), ExpiresAt = expires,
+        };
+
+        var ok = RestoreReq("ok", "a.zip", DateTimeOffset.Now.AddHours(1).ToUnixTimeSeconds());
+        File.WriteAllText(Path.Combine(staging, "a.zip.request.json"), System.Text.Json.JsonSerializer.Serialize(ok));
+        File.WriteAllBytes(Path.Combine(staging, "a.zip.part"), new byte[400]);
+        File.WriteAllText(Path.Combine(staging, "a.zip.part.watermark"), "400");
+        var expired = RestoreReq("expired", "b.zip", DateTimeOffset.Now.AddHours(-1).ToUnixTimeSeconds());
+        File.WriteAllText(Path.Combine(staging, "b.zip.request.json"), System.Text.Json.JsonSerializer.Serialize(expired));
+        File.WriteAllBytes(Path.Combine(staging, "b.zip.part"), new byte[100]);
+        File.WriteAllText(Path.Combine(staging, "broken.request.json"), "{");
+
+        var host = new HostStub();
+        var manager = new DownloadManager(host);
+        await manager.RestoreInterruptedTasks();
+        Check(manager.Tasks.Count == 1 && manager.Tasks[0] is { Stage: DownloadTaskStage.Paused, Received: 400 }
+              && manager.Tasks[0].Title == "T-ok" && manager.HasActiveTask(ok.DeduplicationKey),
+            $"restore: interrupted download restored as resumable paused task (count {manager.Tasks.Count})");
+        Check(!File.Exists(Path.Combine(staging, "b.zip.part"))
+              && !File.Exists(Path.Combine(staging, "b.zip.request.json"))
+              && Plugin.HistoryCollection.Count == historyBefore + 1
+              && Plugin.HistoryCollection[0].Outcome == DownloadRecord.OutcomeFailed,
+            "restore: expired download cleaned and recorded in history");
+        Check(!File.Exists(Path.Combine(staging, "broken.request.json")) && host.Errors == 0,
+            "restore: broken sidecar removed without error events");
+
+        // 取消还原出的任务 → .part/水位/sidecar 一并清理
+        manager.CancelTask(manager.Tasks[0]);
+        Check(!File.Exists(Path.Combine(staging, "a.zip.part"))
+              && !File.Exists(Path.Combine(staging, "a.zip.part.watermark"))
+              && !File.Exists(Path.Combine(staging, "a.zip.request.json")),
+            "restore: cancelling a restored task cleans artifacts and sidecar");
     }
 
     // ---------------------------------------------------------------- 测试用 HTTP 服务器
