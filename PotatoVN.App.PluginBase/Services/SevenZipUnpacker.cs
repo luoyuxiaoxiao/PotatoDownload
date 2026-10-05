@@ -56,14 +56,15 @@ internal static class SevenZipUnpacker
 
     [SupportedOSPlatform("windows")]
     internal static void Extract(InstallRequest request, string path, string targetDirectory,
-        Action<int, int>? onProgress, CancellationToken ct, Action<UnpackProgress>? onDetailedProgress)
+        Action<int, int>? onProgress, CancellationToken ct, Action<UnpackProgress>? onDetailedProgress,
+        string? stripPrefix = null)
     {
         using var archive = new NativeArchive(path, request.ArchivePassword, ct);
         long? total = 0;
         foreach (var entry in archive.Entries.Where(e => !e.IsDirectory))
             total = total is { } sum && entry.Size is { } size && size <= long.MaxValue - sum ? sum + size : null;
         var session = new UnpackService.ExtractionSession(targetDirectory, total,
-            archive.Entries.Count(e => !e.IsDirectory), onProgress, onDetailedProgress, ct);
+            archive.Entries.Count(e => !e.IsDirectory), onProgress, onDetailedProgress, ct, stripPrefix);
         foreach (var entry in archive.Entries)
             session.ValidateEntry(entry.Name, entry.IsDirectory, entry.LinkTarget, entry.Attributes);
         archive.Extract(session);

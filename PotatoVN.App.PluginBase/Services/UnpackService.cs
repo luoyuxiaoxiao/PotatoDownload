@@ -34,9 +34,10 @@ public static class UnpackService
     /// <param name="onProgress">进度回调 (已解压文件数, 总文件数)；总数未知时为 -1</param>
     /// <param name="ct">取消令牌</param>
     /// <param name="onDetailedProgress">实际输出字节、文件计数和当前条目的快照</param>
+    /// <param name="stripPrefix">要剥掉的单一顶层目录（<see cref="ResolveGameDirectory"/> 的判定结果），为 null 时不剥离</param>
     public static Task UnpackAsync(InstallRequest request, string packPath, string targetDirectory,
         Action<int, int>? onProgress = null, CancellationToken ct = default,
-        Action<UnpackProgress>? onDetailedProgress = null)
+        Action<UnpackProgress>? onDetailedProgress = null, string? stripPrefix = null)
     {
         return Task.Run(() =>
         {
@@ -44,14 +45,14 @@ public static class UnpackService
             if (OperatingSystem.IsWindows() && request.ArchiveFormat == "7z")
             {
                 // 原生引擎缺失/损坏必须明确报错；静默回退会把性能问题隐藏成偶发卡顿。
-                SevenZipUnpacker.Extract(request, packPath, targetDirectory, onProgress, ct, onDetailedProgress);
+                SevenZipUnpacker.Extract(request, packPath, targetDirectory, onProgress, ct, onDetailedProgress, stripPrefix);
                 return;
             }
             if (IsTarFamily(request))
             {
                 // tar 及其压缩变体只能流式读取（ArchiveFactory 认不出压缩过的 tar）；总数未知
                 using var tar = TarSource.Open(request, packPath, ct);
-                var progress = new ExtractionSession(targetDirectory, null, null, onProgress, onDetailedProgress, ct);
+                var progress = new ExtractionSession(targetDirectory, null, null, onProgress, onDetailedProgress, ct, stripPrefix);
                 ExtractSequential(tar.Reader, progress, ct);
                 return;
             }
@@ -60,7 +61,7 @@ public static class UnpackService
             var entries = archive.Entries.ToArray();
             var total = entries.Count(e => !e.IsDirectory);
             var session = new ExtractionSession(targetDirectory, TotalSize(entries), total,
-                onProgress, onDetailedProgress, ct);
+                onProgress, onDetailedProgress, ct, stripPrefix);
             if (archive.IsSolid || archive.Type == ArchiveType.SevenZip)
             {
                 // solid 7z/rar 逐条 entry.WriteToDirectory 每个文件都要从 solid 块头重新解压（O(n²)），必须顺序读取
@@ -153,6 +154,7 @@ public static class UnpackService
     {
         private readonly string _root;
         private readonly string _rootPrefix;
+        private readonly string? _stripPrefix;
         private readonly long? _totalBytes;
         private readonly int? _totalFiles;
         private readonly Action<int, int>? _onProgress;
@@ -165,10 +167,12 @@ public static class UnpackService
         private bool _reportedBytes;
 
         internal ExtractionSession(string targetDirectory, long? totalBytes, int? totalFiles,
-            Action<int, int>? onProgress, Action<UnpackProgress>? onDetailedProgress, CancellationToken ct)
+            Action<int, int>? onProgress, Action<UnpackProgress>? onDetailedProgress, CancellationToken ct,
+            string? stripPrefix = null)
         {
             _root = Path.GetFullPath(targetDirectory).TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
             _rootPrefix = _root + Path.DirectorySeparatorChar;
+            _stripPrefix = string.IsNullOrEmpty(stripPrefix) ? null : stripPrefix!.TrimEnd('/', '\\');
             _totalBytes = totalBytes;
             _totalFiles = totalFiles;
             _onProgress = onProgress;
@@ -178,9 +182,30 @@ public static class UnpackService
             Report(true);
         }
 
+        /// <summary>
+        /// 剥掉压缩包的单一顶层目录：入库目录已经用该名字创建，条目仍带此前缀会产生 Game/Game 双层嵌套。
+        /// 只剥"前缀+分隔符"开头的键；等于前缀本身的目录条目（含 "前缀/" 形式）返回空串表示跳过——
+        /// 文件条目绝不剥成空名，否则单文件压缩包（唯一顶层就是文件本身）会被静默丢掉。
+        /// </summary>
+        private string? StripPrefix(string? key, bool directory)
+        {
+            if (_stripPrefix is null || string.IsNullOrEmpty(key)) return key;
+            var prefix = _stripPrefix;
+            if (key.Length > prefix.Length && key[prefix.Length] is '/' or '\\'
+                && key.StartsWith(prefix, StringComparison.OrdinalIgnoreCase))
+            {
+                var rest = key[(prefix.Length + 1)..];
+                return rest.Length > 0 ? rest : directory ? string.Empty : key;
+            }
+            if (directory && key.Equals(prefix, StringComparison.OrdinalIgnoreCase)) return string.Empty;
+            return key;
+        }
+
         internal OutputStream? OpenEntry(string? key, bool directory, long? size, string? linkTarget = null, int? attributes = null)
         {
             _ct.ThrowIfCancellationRequested();
+            key = StripPrefix(key, directory);
+            if (string.IsNullOrEmpty(key)) return null; // 顶层目录条目本身：目标根目录已存在
             ValidateLink(key, linkTarget, attributes);
             var path = SafeEntryPath(key, directory);
             if (directory)
@@ -200,6 +225,8 @@ public static class UnpackService
         internal void ValidateEntry(string? key, bool directory, string? linkTarget, int? attributes)
         {
             _ct.ThrowIfCancellationRequested();
+            key = StripPrefix(key, directory);
+            if (string.IsNullOrEmpty(key)) return; // 与 OpenEntry 一致跳过顶层目录条目本身
             ValidateLink(key, linkTarget, attributes);
             _ = SafeEntryPath(key, directory);
         }
@@ -352,7 +379,17 @@ public static class UnpackService
     /// 根据压缩包内容决定游戏目录名：压缩包内只有一个顶层文件夹时使用该文件夹名，否则使用压缩包文件名（去扩展名）。
     /// 顶层名来自压缩包内容（推送方可控），必须是安全的单段目录名，否则同样退回压缩包文件名。
     /// </summary>
-    public static string ResolveGameDirectoryName(InstallRequest request, string packPath, CancellationToken ct = default)
+    public static string ResolveGameDirectoryName(InstallRequest request, string packPath, CancellationToken ct = default) =>
+        ResolveGameDirectory(request, packPath, ct).Name;
+
+    /// <summary>
+    /// 决定游戏目录名与解压时要剥掉的单一顶层目录前缀。
+    /// 压缩包内只有一个顶层文件夹时：目录名用该文件夹名，且解压必须剥掉这个前缀——
+    /// 入库目录已经用它创建，条目仍带前缀会产生 Game/Game 双层嵌套。
+    /// 其它情况：目录名退回压缩包文件名（去扩展名），不剥离（条目自带各自的顶层目录，正好只有一层）。
+    /// </summary>
+    public static (string Name, string? StripPrefix) ResolveGameDirectory(InstallRequest request, string packPath,
+        CancellationToken ct = default)
     {
         var topLevel = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         foreach (var key in EntryKeys(request, packPath, ct))
@@ -363,11 +400,14 @@ public static class UnpackService
             if (topLevel.Count > 1) break; // 已确定不是单一顶层目录，流式格式无需再读完整个包
         }
         if (topLevel.Count == 1 && InstallRequest.IsSafeFileName(topLevel.First()))
-            return topLevel.First();
+        {
+            var top = topLevel.First();
+            return (top, top);
+        }
 
         var stem = Path.GetFileNameWithoutExtension(Path.GetFileName(packPath));
         if (stem.EndsWith(".tar", StringComparison.OrdinalIgnoreCase)) stem = stem[..^4];
-        return InstallRequest.IsSafeFileName(stem) ? stem : "game";
+        return (InstallRequest.IsSafeFileName(stem) ? stem : "game", null);
     }
 
     private static IEnumerable<string> EntryKeys(InstallRequest request, string packPath, CancellationToken ct)

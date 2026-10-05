@@ -41,8 +41,11 @@ public class LibraryService
             var game = await _hostApi.AddVirtualGame(request.Title, force: false, requireConfirm: false);
             if (!string.IsNullOrEmpty(request.BgmId))
                 game.Ids[(int)RssType.Bangumi] = request.BgmId;
-            if (!string.IsNullOrEmpty(request.VndbId))
-                game.Ids[(int)RssType.Vndb] = request.VndbId;
+            // 宿主刮削器存的是不带前缀的数字（VndbPhraser: "v4"->"4"），原样写入带 v 前缀的
+            // Shionlib ID 会在 UID 匹配时与宿主刮削结果冲突（GetMatchKind 任一 ID 对不等即判不同游戏）。
+            var vndbId = NormalizeVndbId(request.VndbId);
+            if (!string.IsNullOrEmpty(vndbId))
+                game.Ids[(int)RssType.Vndb] = vndbId;
             if (!string.IsNullOrEmpty(request.HikarinagiId))
                 game.Ids[(int)RssType.Hikarinagi] = request.HikarinagiId;
             return game;
@@ -69,6 +72,49 @@ public class LibraryService
                 $"在线刮削仅按名称匹配（{e.Message}），当前宿主版本不支持手动关联到占位游戏，请在 PotatoVN 中手动处理。", e);
         }
     }
+
+    /// <summary>
+    /// 在安装目录写入本地 meta（Name + 外部 ID），让 <see cref="AddInstallationAsync"/> 跳过按目录名的
+    /// 二次在线刮削：宿主优先读本地 meta，其 UID 与占位游戏精确一致，不会因刮削偏差重复建游戏。
+    /// 有占位时用占位的 ID 集合（宿主刮削 ∪ 推送 ID，与匹配目标必然一致）；无占位时用推送 ID。
+    /// 返回是否真正写入（压缩包自带 meta 时不覆盖）；入库结束后必须用 <see cref="CleanupLocalMeta"/> 移除。
+    /// </summary>
+    public bool WriteLocalMeta(InstallRequest request, string gamePath, Galgame? placeholder)
+    {
+        try
+        {
+            string name;
+            string?[] ids;
+            if (placeholder is not null)
+            {
+                name = placeholder.Name.Value ?? request.Title;
+                ids = (string?[])placeholder.Ids.Clone();
+            }
+            else
+            {
+                name = request.Title;
+                ids = new string?[Galgame.PhraserNumber];
+                if (!string.IsNullOrEmpty(request.BgmId))
+                    ids[(int)RssType.Bangumi] = request.BgmId;
+                var vndbId = NormalizeVndbId(request.VndbId);
+                if (!string.IsNullOrEmpty(vndbId))
+                    ids[(int)RssType.Vndb] = vndbId;
+                if (!string.IsNullOrEmpty(request.HikarinagiId))
+                    ids[(int)RssType.Hikarinagi] = request.HikarinagiId;
+            }
+            return LocalMetaWriter.TryWrite(gamePath, name, ids);
+        }
+        catch (Exception e)
+        {
+            // 写不上就退回宿主在线刮削的老路（可能重复建游戏），不阻断入库
+            _hostApi.Log(Microsoft.UI.Xaml.Controls.InfoBarSeverity.Warning,
+                $"PotatoDownload: write local meta skipped for '{request.Title}': {e.Message}");
+            return false;
+        }
+    }
+
+    /// <summary>入库结束后移除 <see cref="WriteLocalMeta"/> 写入的稀疏 meta（见 <see cref="LocalMetaWriter.Cleanup"/>）。</summary>
+    public static void CleanupLocalMeta(string gamePath) => LocalMetaWriter.Cleanup(gamePath);
 
     /// <summary>在库中按外部 ID 查找同一游戏（任一 ID 命中即视为同一游戏）。</summary>
     private Galgame? FindExisting(InstallRequest request)

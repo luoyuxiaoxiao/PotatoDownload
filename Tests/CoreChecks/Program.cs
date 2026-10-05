@@ -385,6 +385,55 @@ internal static class Program
         MakeZip(weird, ("a.txt", "a"), ("b.txt", "b"));
         Check(UnpackService.ResolveGameDirectoryName(req, weird) == "game", "resolve: unsafe stem '.' falls back to 'game'");
 
+        // 单一顶层目录的剥离：入库目录已与顶层同名，解压必须剥掉前缀，否则产生 Game/Game 双层嵌套
+        var nested = Path.Combine(dir, "nested.zip");
+        MakeZip(nested, ("Game/", ""), ("Game/a.txt", "a"), ("Game/b/c.txt", "c"));
+        var (nestedName, nestedStrip) = UnpackService.ResolveGameDirectory(req, nested);
+        Check(nestedName == "Game" && nestedStrip == "Game",
+            $"resolve: single top-level also yields strip prefix ({nestedName}/{nestedStrip ?? "null"})");
+        var nestedOut = UnpackService.PrepareGameDirectory(dir, "nested-out");
+        var eNested = await Throws(() => UnpackService.UnpackAsync(req, nested, nestedOut, stripPrefix: nestedStrip));
+        Check(eNested is null && File.ReadAllText(Path.Combine(nestedOut, "a.txt")) == "a"
+              && File.ReadAllText(Path.Combine(nestedOut, "b", "c.txt")) == "c"
+              && !Directory.Exists(Path.Combine(nestedOut, "Game")),
+            $"unpack: single top-level stripped, no double nesting ({eNested?.Message})");
+        Check(UnpackService.ResolveGameDirectory(req, flat).StripPrefix is null,
+            "resolve: multiple top-level entries get no strip prefix");
+
+        // 单文件压缩包：唯一顶层是文件本身，剥离绝不能把它变成空名丢掉
+        var oneFile = Path.Combine(dir, "onefile.zip");
+        MakeZip(oneFile, ("setup.exe", "exe"));
+        var (oneName, oneStrip) = UnpackService.ResolveGameDirectory(req, oneFile);
+        var oneOut = UnpackService.PrepareGameDirectory(dir, "onefile-out");
+        var eOne = await Throws(() => UnpackService.UnpackAsync(req, oneFile, oneOut, stripPrefix: oneStrip));
+        Check(eOne is null && File.ReadAllText(Path.Combine(oneOut, "setup.exe")) == "exe",
+            $"unpack: single-file archive survives stripping (name '{oneName}', {eOne?.Message})");
+
+        // 本地 meta：宿主格式的 .PotatoVN/meta.json（GameMetaBackup v2 子集），写一次、绝不覆盖、入库后清理
+        var metaGame = Path.Combine(dir, "meta-game");
+        Directory.CreateDirectory(metaGame);
+        var ids = new string?[9];
+        ids[0] = "4";  // RssType.Vndb
+        ids[1] = "13"; // RssType.Bangumi
+        Check(LocalMetaWriter.TryWrite(metaGame, "CLANNAD", ids), "meta: local meta written");
+        var metaFile = Path.Combine(metaGame, ".PotatoVN", "meta.json");
+        using (var doc = System.Text.Json.JsonDocument.Parse(File.ReadAllText(metaFile)))
+        {
+            var game = doc.RootElement.GetProperty("Game");
+            Check(doc.RootElement.GetProperty("Version").GetInt32() == 2
+                  && game.GetProperty("Name").GetProperty("Value").GetString() == "CLANNAD"
+                  && game.GetProperty("Ids")[0].GetString() == "4"
+                  && game.GetProperty("Ids")[1].GetString() == "13",
+                "meta: host-shaped backup (Version/Game.Name.Value/Ids)");
+        }
+        Check(!LocalMetaWriter.TryWrite(metaGame, "OTHER", ids), "meta: existing meta never overwritten");
+        File.WriteAllText(Path.Combine(metaGame, ".PotatoVN", "cover.png"), "x");
+        LocalMetaWriter.Cleanup(metaGame);
+        Check(!File.Exists(metaFile) && File.Exists(Path.Combine(metaGame, ".PotatoVN", "cover.png")),
+            "meta: cleanup removes only our file, keeps host-written backup");
+        LocalMetaWriter.Cleanup(metaGame); // 重复清理不抛
+        LocalMetaWriter.Cleanup(Path.Combine(dir, "meta-missing")); // 目录不存在也不抛
+
         // 目录准备：不删用户目录、只清理自己的未完成残留、完成后不再删除
         var foreign = Path.Combine(dir, "Existing");
         Directory.CreateDirectory(foreign);
@@ -425,13 +474,19 @@ internal static class Program
                 V = 1, Provider = "shionlib", ResourceId = "1", Url = "https://dl.example.com/t", FileName = $"tarred.{ext}",
                 ArchiveFormat = ext, Size = 1, BgmId = "13", Title = "t",
             };
-            var name = UnpackService.ResolveGameDirectoryName(reqTar, tarPath);
+            var (name, tarStrip) = UnpackService.ResolveGameDirectory(reqTar, tarPath);
             Check(name == "Game", $"{ext}: top-level folder resolved (got '{name}')");
             var outTar = UnpackService.PrepareGameDirectory(dir, $"out-{ext}");
             var eTar = await Throws(() => UnpackService.UnpackAsync(reqTar, tarPath, outTar));
             Check(eTar is null && File.Exists(Path.Combine(outTar, "Game", "game.exe"))
                   && File.ReadAllBytes(Path.Combine(outTar, "Game", "data", "a.bin")).AsSpan().SequenceEqual(content),
                 $"{ext}: extracted with real file contents ({eTar?.Message})");
+            var outTar2 = UnpackService.PrepareGameDirectory(dir, $"out2-{ext}");
+            var eTar2 = await Throws(() => UnpackService.UnpackAsync(reqTar, tarPath, outTar2, stripPrefix: tarStrip));
+            Check(tarStrip == "Game" && eTar2 is null && File.Exists(Path.Combine(outTar2, "game.exe"))
+                  && File.ReadAllBytes(Path.Combine(outTar2, "data", "a.bin")).AsSpan().SequenceEqual(content)
+                  && !Directory.Exists(Path.Combine(outTar2, "Game")),
+                $"{ext}: single top-level stripped, contents intact ({eTar2?.Message})");
         }
 
         var sevenZip = Path.Combine(dir, "solid.7z");
@@ -461,6 +516,13 @@ internal static class Program
         Check(e7z is null && File.ReadAllBytes(Path.Combine(out7, "Game", "data", "a.bin")).AsSpan().SequenceEqual(content)
               && File.Exists(Path.Combine(out7, "Game", "game.exe")), $"7z: solid+encrypted archive extracted via sequential reader ({e7z?.Message})");
         Check(progress.Count == 2 && progress[^1] == (2, 2), $"7z: progress reported per file ({progress.Count} callbacks)");
+        var out7s = UnpackService.PrepareGameDirectory(dir, "GameStripped");
+        var e7zs = await Throws(() => UnpackService.UnpackAsync(reqPw, sevenZip, out7s,
+            stripPrefix: UnpackService.ResolveGameDirectory(reqPw, sevenZip).StripPrefix));
+        Check(e7zs is null && File.Exists(Path.Combine(out7s, "game.exe"))
+              && File.ReadAllBytes(Path.Combine(out7s, "data", "a.bin")).AsSpan().SequenceEqual(content)
+              && !Directory.Exists(Path.Combine(out7s, "Game")),
+            $"7z: native engine strips single top-level dir ({e7zs?.Message})");
         var wrong = await Throws(() => UnpackService.UnpackAsync(Req(fileName: "solid.7z", password: "nope"), sevenZip, UnpackService.PrepareGameDirectory(dir, "GameWrong")));
         Check(wrong is not null, "7z: wrong password fails instead of writing garbage");
 
@@ -485,6 +547,11 @@ internal static class Program
             Check(rarName == "Game" && eRar is null && File.Exists(Path.Combine(outRar, "Game", "game.exe"))
                   && File.ReadAllBytes(Path.Combine(outRar, "Game", "data", "a.bin")).AsSpan().SequenceEqual(content),
                 $"{label}: extracted via sequential reader (name '{rarName}', {eRar?.Message})");
+            var outRar2 = UnpackService.PrepareGameDirectory(dir, $"out2-{label}");
+            var eRar2 = await Throws(() => UnpackService.UnpackAsync(reqRar, rarPath, outRar2, stripPrefix: "Game"));
+            Check(eRar2 is null && File.Exists(Path.Combine(outRar2, "game.exe"))
+                  && !Directory.Exists(Path.Combine(outRar2, "Game")),
+                $"{label}: solid reader strips single top-level dir ({eRar2?.Message})");
         }
     }
 
@@ -544,8 +611,9 @@ internal static class Program
         Check(t1.UnpackProgress is { FilesExtracted: 2 } unpack && unpack.BytesExtracted == content.Length + 3 &&
               unpack.TotalBytes == unpack.BytesExtracted && t1.ProgressPercent == 100,
             "manager: completed pipeline publishes final extraction bytes and completion percentage");
-        // 游戏目录名取自压缩包唯一顶层文件夹（Game），包内结构原样解到该目录下：downloads/Game/Game/game.exe
-        Check(File.Exists(Path.Combine(downloadDir, "Game", "Game", "game.exe"))
+        // 游戏目录名取自压缩包唯一顶层文件夹（Game），顶层前缀被剥掉：downloads/Game/game.exe
+        Check(File.Exists(Path.Combine(downloadDir, "Game", "game.exe"))
+              && !File.Exists(Path.Combine(downloadDir, "Game", "Game", "game.exe"))
               && !File.Exists(Path.Combine(downloadDir, "Game", UnpackService.IncompleteMarker)), "manager: game extracted and marked complete");
         Check(!File.Exists(pack) && !PartExists(), "manager: staging archive removed after import");
         Check(Plugin.HistoryCollection.Count == 1 && Plugin.HistoryCollection[0].Outcome == DownloadRecord.OutcomeCompleted,
@@ -571,7 +639,7 @@ internal static class Program
         Check(manager.HasActiveTask(t3.Request.DeduplicationKey), "manager: a paused task still blocks a duplicate push");
         manager.ResumeTask(t3);
         await WaitUntilAsync(() => t3.IsListed ? null : t3, "resumed task to finish", 90000);
-        Check(t3.Stage == DownloadTaskStage.Completed && File.Exists(Path.Combine(downloadDir, "Game (2)", "Game", "game.exe")),
+        Check(t3.Stage == DownloadTaskStage.Completed && File.Exists(Path.Combine(downloadDir, "Game (2)", "game.exe")),
             $"manager: resume finishes the paused task into 'Game (2)' ({t3.Stage}: {t3.Message})");
 
         // 4. 暂停后取消 → 清理现场

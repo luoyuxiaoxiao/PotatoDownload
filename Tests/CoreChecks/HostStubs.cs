@@ -50,6 +50,8 @@ namespace PotatoVN.App.PluginBase.Services
     {
         public Task<object?> EnsurePlaceholderAsync(InstallRequest request) => Task.FromResult<object?>(hostApi is null ? null : request);
         public Task AddInstallationAsync(InstallRequest request, string gamePath) => Task.CompletedTask;
+        public bool WriteLocalMeta(InstallRequest request, string gamePath, object? placeholder) => false;
+        public static void CleanupLocalMeta(string gamePath) { }
     }
 }
 

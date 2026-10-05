@@ -384,21 +384,32 @@ public class DownloadManager
                 return;
             }
 
-            // 4. 解压：目录名来自压缩包内容，落在下载目录内；不删除任何不是本插件创建的目录
+            // 4. 解压：目录名来自压缩包内容，落在下载目录内；不删除任何不是本插件创建的目录。
+            //    压缩包只有一个顶层文件夹时入库目录与其同名，解压必须剥掉该前缀，否则会多套一层同名目录。
             task.Message = "正在读取压缩包…";
             task.Stage = DownloadTaskStage.Unpacking;
-            var gameDirName = UnpackService.ResolveGameDirectoryName(task.Request, packPath, ct);
+            var (gameDirName, stripPrefix) = UnpackService.ResolveGameDirectory(task.Request, packPath, ct);
             var gamePath = UnpackService.PrepareGameDirectory(downloadDir, gameDirName);
             task.GamePath = gamePath;
             await UnpackService.UnpackAsync(task.Request, packPath, gamePath,
-                ct: ct, onDetailedProgress: progress => task.UnpackProgress = progress);
+                ct: ct, onDetailedProgress: progress => task.UnpackProgress = progress, stripPrefix: stripPrefix);
 
-            // 5. 入库 + 刮削：占位游戏到这里才创建，下载失败的任务不会在库里留下空条目
+            // 5. 入库 + 刮削：占位游戏到这里才创建，下载失败的任务不会在库里留下空条目。
+            //    写入本地 meta（占位/推送的精确 ID）让宿主免按目录名二次刮削——
+            //    二次刮削结果一旦与占位 UID 冲突（如 vndb 前缀差异、命中不同条目）就会重复建游戏。
             task.Message = "入库刮削中...";
             task.Stage = DownloadTaskStage.Importing;
             var library = new LibraryService(_hostApi);
-            await library.EnsurePlaceholderAsync(task.Request);
-            await library.AddInstallationAsync(task.Request, gamePath);
+            var placeholder = await library.EnsurePlaceholderAsync(task.Request);
+            var wroteMeta = library.WriteLocalMeta(task.Request, gamePath, placeholder);
+            try
+            {
+                await library.AddInstallationAsync(task.Request, gamePath);
+            }
+            finally
+            {
+                if (wroteMeta) LibraryService.CleanupLocalMeta(gamePath);
+            }
             UnpackService.MarkComplete(gamePath);
 
             // 6. 清理压缩包
