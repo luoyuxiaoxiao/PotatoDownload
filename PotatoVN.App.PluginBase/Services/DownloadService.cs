@@ -252,12 +252,24 @@ public class DownloadService : IDisposable
         LogChannelChoice(request, log);
 
         var totalBytes = (long)request.Size;
+        var hasHash = request.ChecksumAlgo is not null && request.Checksum is not null;
         if (File.Exists(targetPath) && new FileInfo(targetPath).Length == totalBytes)
         {
-            // 上次已下载完整（例如在解压/入库阶段失败）——直接复用，由调用方重新校验哈希
-            log?.Invoke("target already complete, skip download");
-            onProgress?.Invoke(totalBytes, totalBytes);
-            return;
+            if (hasHash)
+            {
+                // 上次已下载完整（例如在解压/入库阶段失败）——直接复用，由调用方重新校验哈希
+                log?.Invoke("target already complete, skip download");
+                onProgress?.Invoke(totalBytes, totalBytes);
+                return;
+            }
+            if (await ConfirmServerTotalAsync(request.Url, totalBytes, ct, log))
+            {
+                // 无哈希时只确认了长度一致，内容仍未校验（同长损坏需解压或源哈希发现）
+                log?.Invoke("target length matches server total, skip download (content unverified without hash)");
+                onProgress?.Invoke(totalBytes, totalBytes);
+                return;
+            }
+            log?.Invoke("target length matches pushed size but server total unconfirmed, re-downloading");
         }
 
         var partPath = targetPath + ".part";
@@ -269,22 +281,43 @@ public class DownloadService : IDisposable
             throw new DownloadException($"磁盘空间不足：需要 {totalBytes - alreadyOnDisk:N0} 字节，可用 {free:N0} 字节");
         try
         {
+            var reusedCompletePart = false;
             if (IsAlreadyComplete(partPath, watermarkPath, totalBytes))
             {
-                log?.Invoke("reuse complete .part, skip download");
-                onProgress?.Invoke(totalBytes, totalBytes);
+                if (hasHash)
+                {
+                    log?.Invoke("reuse complete .part, skip download");
+                    onProgress?.Invoke(totalBytes, totalBytes);
+                    reusedCompletePart = true;
+                }
+                else if (await ConfirmServerTotalAsync(request.Url, totalBytes, ct, log))
+                {
+                    log?.Invoke("reuse complete .part, skip download (content unverified without hash)");
+                    onProgress?.Invoke(totalBytes, totalBytes);
+                    reusedCompletePart = true;
+                }
+                else
+                {
+                    // 无法确认服务器总长：不按本地长度宣告完成，删掉看似完整的 .part 走正常下载
+                    log?.Invoke("complete .part length unconfirmed by server, re-downloading");
+                    TryDelete(partPath);
+                    TryDelete(watermarkPath);
+                }
             }
-            else if (await ProbeRangeAsync(request.Url, ct, log))
+            if (!reusedCompletePart)
             {
-                var chunkSize = GetChunkSize(totalBytes);
-                log?.Invoke($"probe: range supported, chunked download ({(totalBytes + chunkSize - 1) / chunkSize} chunks, up to {MaxConnections} connections, chunk size {chunkSize} bytes)");
-                await DownloadChunkedAsync(request, partPath, watermarkPath, chunkSize, onProgress, ct, log);
-            }
-            else
-            {
-                log?.Invoke("probe: range NOT supported, sequential download");
-                await RetryAsync(() => DownloadSequentialAsync(request, partPath, watermarkPath, onProgress, ct),
-                    ct, log, "sequential download");
+                if (await ProbeRangeAsync(request.Url, totalBytes, ct, log))
+                {
+                    var chunkSize = GetChunkSize(totalBytes);
+                    log?.Invoke($"probe: range supported, chunked download ({(totalBytes + chunkSize - 1) / chunkSize} chunks, up to {MaxConnections} connections, chunk size {chunkSize} bytes)");
+                    await DownloadChunkedAsync(request, partPath, watermarkPath, chunkSize, onProgress, ct, log);
+                }
+                else
+                {
+                    log?.Invoke("probe: range NOT supported, sequential download");
+                    await RetryAsync(() => DownloadSequentialAsync(request, partPath, watermarkPath, onProgress, ct),
+                        ct, log, "sequential download");
+                }
             }
         }
         catch (OperationCanceledException) when (!ct.IsCancellationRequested)
@@ -317,8 +350,9 @@ public class DownloadService : IDisposable
     /// 探测服务器是否支持 HTTP Range（发一个 1 字节 Range 请求看是否回 206）。
     /// 瞬时错误按统一策略重试——探测时撞上一次 429/5xx 就静默退化成单连接会把整个下载拖慢数倍；
     /// 明确拒绝（401/403/404 等）直接失败，避免用一条更难懂的顺序下载错误代替真正原因。
+    /// 206 必须携带与推送 size 一致的总长，否则说明推送 size 偏小，直接失败不把前缀当完整文件。
     /// </summary>
-    private Task<bool> ProbeRangeAsync(string url, CancellationToken ct, Action<string>? log) =>
+    private Task<bool> ProbeRangeAsync(string url, long expectedTotal, CancellationToken ct, Action<string>? log) =>
         RetryAsync(async () =>
         {
             using var idle = CreateIdleCts(ct);
@@ -327,8 +361,13 @@ public class DownloadService : IDisposable
             using var response = await SendAsync(request, idle.Token);
             if (response.StatusCode == HttpStatusCode.PartialContent)
             {
-                // 把这 1 个字节读完再放手：连接干净归还连接池，代理侧（Shionlib 按会话计连接数）也能立刻释放这条连接的名额
-                await response.Content.ReadAsByteArrayAsync(idle.Token);
+                ValidateRangeResponse(response, 0, 0, expectedTotal);
+                // 只读预期的 1 个字节并确认数据确实到达，不再无上限 ReadAsByteArrayAsync
+                await using var contentStream = await response.Content.ReadAsStreamAsync(idle.Token);
+                var probeBuffer = new byte[1];
+                var got = await ReadAsync(contentStream, probeBuffer, idle);
+                if (got != 1)
+                    throw new DownloadException($"探测返回数据不完整：期望 1 字节，实际 {got} 字节");
                 return true;
             }
             ThrowIfFailed(response);
@@ -344,6 +383,61 @@ public class DownloadService : IDisposable
             throw new HttpRequestException($"服务器暂时不可用（HTTP {code}）", null, response.StatusCode);
         throw new DownloadException($"服务器拒绝了下载请求（HTTP {code}），直链可能已失效");
     }
+
+    /// <summary>
+    /// 统一校验 206 分块响应：Content-Range 必须为 bytes、From/To 与请求一致、
+    /// Length（资源总长）必须已知且等于推送 size；同时保留 Content-Length 等于本次请求长度的检查。
+    /// 总长不一致说明推送 size 偏小（或服务器资源已变），把截断前缀当完整文件会得到坏包，必须直接失败。
+    /// </summary>
+    private static void ValidateRangeResponse(HttpResponseMessage response, long start, long end, long expectedTotal)
+    {
+        var range = response.Content.Headers.ContentRange;
+        if (range is null)
+            throw new DownloadException($"服务器未返回 Content-Range，无法确认总大小：推送 {expectedTotal} 字节，请求范围 {start}-{end}");
+        if (!string.Equals(range.Unit, "bytes", StringComparison.OrdinalIgnoreCase))
+            throw new DownloadException($"服务器返回的范围单位不受支持：{range.Unit}（推送 {expectedTotal} 字节）");
+        if (range.From != start || range.To != end)
+            throw new DownloadException($"服务器返回的分块范围不符：请求 {start}-{end}，返回 {range.From}-{range.To}");
+        if (range.Length is null)
+            throw new DownloadException($"服务器未返回资源总大小，无法确认完整性：推送 {expectedTotal} 字节，请求范围 {start}-{end}");
+        if (range.Length.Value != expectedTotal)
+            throw new DownloadException($"服务器声明的总大小与推送不一致：推送 {expectedTotal} 字节，服务器 {range.Length.Value} 字节");
+        var expectedLength = end - start + 1;
+        if (response.Content.Headers.ContentLength is { } declared && declared != expectedLength)
+            throw new DownloadException($"服务器返回的分块长度不符：期望 {expectedLength}，返回 {declared}");
+    }
+
+    /// <summary>
+    /// 无哈希历史复用前的联网确认：206 走与分块相同的总长校验；200 只有完整 Content-Length 等于推送 size
+    /// 才算确认；无长度信息时返回 false（不按本地长度宣告完成，走正常下载）。
+    /// 总长不一致直接抛确定性错误（含推送与服务器字节数），不重试。
+    /// </summary>
+    private Task<bool> ConfirmServerTotalAsync(string url, long expectedTotal, CancellationToken ct, Action<string>? log) =>
+        RetryAsync(async () =>
+        {
+            using var idle = CreateIdleCts(ct);
+            using var request = new HttpRequestMessage(HttpMethod.Get, url);
+            request.Headers.Range = new RangeHeaderValue(0, 0);
+            using var response = await SendAsync(request, idle.Token);
+            if (response.StatusCode == HttpStatusCode.PartialContent)
+            {
+                ValidateRangeResponse(response, 0, 0, expectedTotal);
+                await using var contentStream = await response.Content.ReadAsStreamAsync(idle.Token);
+                var buffer = new byte[1];
+                var got = await ReadAsync(contentStream, buffer, idle);
+                if (got != 1)
+                    throw new DownloadException($"探测返回数据不完整：期望 1 字节，实际 {got} 字节");
+                return true;
+            }
+            ThrowIfFailed(response);
+            if (response.Content.Headers.ContentLength is { } length)
+            {
+                if (length != expectedTotal)
+                    throw new DownloadException($"服务器声明的总大小与推送不一致：推送 {expectedTotal} 字节，服务器 {length} 字节");
+                return true;
+            }
+            return false;
+        }, ct, log, "confirm total");
 
     /// <summary>
     /// 瞬时错误重试（对齐 takanawa：指数退避 1/2/4/8s）。网络错误、空闲超时、408/429/5xx 可重试；
@@ -436,7 +530,7 @@ public class DownloadService : IDisposable
                         token.ThrowIfCancellationRequested();
                         var end = ChunkEnd(chunkIndex, chunkSize, totalBytes);
                         // 瞬时断流保留本块已经写好的字节，下一次只请求剩余部分；整块回退会把 UI 的速度增量拉成负数。
-                        await RetryAsync(() => DownloadChunkAsync(request.Url, handle, offsets[chunkIndex], end,
+                        await RetryAsync(() => DownloadChunkAsync(request.Url, handle, offsets[chunkIndex], end, totalBytes,
                                 delta =>
                                 {
                                     offsets[chunkIndex] += delta;
@@ -506,7 +600,7 @@ public class DownloadService : IDisposable
 
     /// <summary>下载分块尚未写入的范围。<paramref name="report"/> 每次写入报告正增量，失败重试保留此前已写的前缀。</summary>
     private async Task DownloadChunkAsync(string url, SafeFileHandle handle,
-        long start, long end, Action<long> report, CancellationToken ct)
+        long start, long end, long expectedTotal, Action<long> report, CancellationToken ct)
     {
         if (start > end) return;
         using var idle = CreateIdleCts(ct);
@@ -518,11 +612,8 @@ public class DownloadService : IDisposable
             ThrowIfFailed(response);
             throw new DownloadException($"服务器未按 Range 返回分块（状态码 {(int)response.StatusCode}）");
         }
+        ValidateRangeResponse(response, start, end, expectedTotal);
         var length = end - start + 1;
-        if (response.Content.Headers.ContentRange is { From: { } from, To: { } to } && (from != start || to != end))
-            throw new DownloadException($"服务器返回的分块范围不符：请求 {start}-{end}，返回 {from}-{to}");
-        if (response.Content.Headers.ContentLength is { } declared && declared != length)
-            throw new DownloadException($"服务器返回的分块长度不符：期望 {length}，返回 {declared}");
 
         await using var contentStream = await response.Content.ReadAsStreamAsync(idle.Token);
         var buffer = new byte[BufferSize];
@@ -555,7 +646,12 @@ public class DownloadService : IDisposable
         using var response = await SendAsync(httpRequest, idle.Token);
         ThrowIfFailed(response);
 
-        if (committed > 0 && response.StatusCode != HttpStatusCode.PartialContent)
+        if (response.StatusCode == HttpStatusCode.PartialContent)
+        {
+            // 顺序续传同样校验 Content-Range：From 必须等于续传点，To/Length 必须等于推送总量
+            ValidateRangeResponse(response, committed, totalBytes - 1, totalBytes);
+        }
+        else if (committed > 0)
         {
             // 服务端忽略了 Range（整包返回）——必须从头覆盖写入，否则会在已有数据后继续追加
             // （2026-09 实测：上次校验失败留下的完整 .part + 水位，续传时整包追加导致 2 倍大小）
