@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Concurrent;
+using System.Diagnostics;
 using System.IO;
 using System.Linq;
 using System.Net;
@@ -29,9 +30,11 @@ public class DownloadService : IDisposable
 {
     private const int DefaultChunkSize = 64 * 1024 * 1024; // 大文件每块 64MiB，减少请求切换和代理租约释放造成的空档
     private const int MinimumChunkSize = 16 * 1024 * 1024; // 小文件保留原有并发能力，不为凑大块而减少活跃连接
-    // 分块并发连接数。Shionlib 下载代理按会话最多 8 个租约（ReinaManager 也开 8），租约要等响应管道结束才释放，
-    // 留 2 个名额给释放延迟与探测请求；真撞上限也只是 429 → 退避重试，不致命
-    private const int MaxConnections = 6;
+    // 并发三档：Shionlib 下载代理按会话最多 8 个租约（ReinaManager 也开 8），稳态用 6、
+    // 下限 2。撞上限只是 429 → 退避重试，不致命；AIMD 见 AimdThrottle。
+    private const int SteadyConnections = 6;
+    private const int HardMaxConnections = 8;
+    private const int MinConnections = 2;
     private const int DefaultMaxAttempts = 5;             // 单个请求（探测/分块/顺序）最多尝试次数
     private const int BufferSize = 81920;
     private static readonly TimeSpan DefaultIdleTimeout = TimeSpan.FromSeconds(60);
@@ -51,6 +54,19 @@ public class DownloadService : IDisposable
 
     /// <summary>瞬时错误的最多尝试次数（测试用）。</summary>
     internal int MaxAttempts { get; init; } = DefaultMaxAttempts;
+
+    /// <summary>掉队接管的最小块内剩余量（测试用）：小于此值的慢尾由原连接跑完，不值得换连接。</summary>
+    internal long HandoffMinBytes { get; init; } = 8L * 1024 * 1024;
+
+    /// <summary>掉队接管的最小时长（测试用）：块认领后经过这么久仍未完成，且队列已空，才允许换连接接管。</summary>
+    internal TimeSpan MinHandoffAge { get; init; } = TimeSpan.FromSeconds(10);
+
+    /// <summary>单块最多被接管次数（测试用）：超限后不再换连接，避免在持续慢源上空转租约。</summary>
+    internal int MaxHandoffsPerChunk { get; init; } = 3;
+
+    /// <summary>本次实例累计的接管次数（测试用）。</summary>
+    internal int HandoffCount => Volatile.Read(ref _handoffCount);
+    private int _handoffCount;
 
     /// <summary>代理选择策略（测试用）：null 时用任务快照的系统代理及其绕过列表判定。</summary>
     internal Func<Uri, bool>? ProxySelector { get; init; }
@@ -309,7 +325,7 @@ public class DownloadService : IDisposable
                 if (await ProbeRangeAsync(request.Url, totalBytes, ct, log))
                 {
                     var chunkSize = GetChunkSize(totalBytes);
-                    log?.Invoke($"probe: range supported, chunked download ({(totalBytes + chunkSize - 1) / chunkSize} chunks, up to {MaxConnections} connections, chunk size {chunkSize} bytes)");
+                    log?.Invoke($"probe: range supported, chunked download ({(totalBytes + chunkSize - 1) / chunkSize} chunks, steady {SteadyConnections} up to {HardMaxConnections} tail connections, chunk size {chunkSize} bytes)");
                     await DownloadChunkedAsync(request, partPath, watermarkPath, chunkSize, onProgress, ct, log);
                 }
                 else
@@ -380,8 +396,27 @@ public class DownloadService : IDisposable
         var code = (int)response.StatusCode;
         if (code is >= 200 and < 300) return;
         if (code is 408 or 429 or >= 500)
-            throw new HttpRequestException($"服务器暂时不可用（HTTP {code}）", null, response.StatusCode);
+            throw new TransientHttpException($"服务器暂时不可用（HTTP {code}）", response.StatusCode, ParseRetryAfter(response));
         throw new DownloadException($"服务器拒绝了下载请求（HTTP {code}），直链可能已失效");
+    }
+
+    /// <summary>读服务端建议的等待时间（Retry-After 秒数或日期），解析失败或缺失返回 null。</summary>
+    private static TimeSpan? ParseRetryAfter(HttpResponseMessage response)
+    {
+        try
+        {
+            var value = response.Headers.RetryAfter;
+            if (value is null) return null;
+            TimeSpan wait;
+            if (value.Delta.HasValue) wait = value.Delta.Value;
+            else if (value.Date.HasValue) wait = value.Date.Value - DateTimeOffset.UtcNow;
+            else return null;
+            return TimeSpan.FromSeconds(Math.Clamp(wait.TotalSeconds, 0, 120));
+        }
+        catch
+        {
+            return null;
+        }
     }
 
     /// <summary>
@@ -440,18 +475,28 @@ public class DownloadService : IDisposable
         }, ct, log, "confirm total");
 
     /// <summary>
-    /// 瞬时错误重试（对齐 takanawa：指数退避 1/2/4/8s）。网络错误、空闲超时、408/429/5xx 可重试；
-    /// 调用方取消与 <see cref="DownloadException"/>（确定性错误）立即抛出。
+    /// 瞬时错误重试（对齐 takanawa：指数退避 1/2/4/8s，并遵守服务端 Retry-After）。
+    /// 网络错误、空闲超时、408/429/5xx 可重试；调用方取消、接管冲突与
+    /// <see cref="DownloadException"/>（确定性错误）立即抛出。
+    /// <paramref name="onTransient"/> 每次瞬时失败调用一次（AIMD 降速信号），
+    /// <paramref name="onResponse"/> 每次成功响应调用一次（AIMD 恢复信号）。
     /// </summary>
-    private async Task<T> RetryAsync<T>(Func<Task<T>> action, CancellationToken ct, Action<string>? log, string what)
+    private async Task<T> RetryAsync<T>(Func<Task<T>> action, CancellationToken ct, Action<string>? log, string what,
+        Action? onTransient = null, Action? onResponse = null)
     {
         for (var attempt = 1; ; attempt++)
         {
             try
             {
-                return await action();
+                var result = await action();
+                onResponse?.Invoke();
+                return result;
             }
             catch (OperationCanceledException) when (ct.IsCancellationRequested)
+            {
+                throw;
+            }
+            catch (ChunkSupersededException)
             {
                 throw;
             }
@@ -459,22 +504,40 @@ public class DownloadService : IDisposable
             {
                 throw;
             }
+            catch (TransientHttpException e) when (attempt < MaxAttempts)
+            {
+                onTransient?.Invoke();
+                var backoff = TimeSpan.FromSeconds(Math.Min(8, 1 << (attempt - 1)));
+                // 服务端给了明确等待时间（如 Shionlib 限流的 Retry-After: 1）就遵守，不小于它；
+                // 叠加 0-0.5s 抖动，避免多连接同时撞限流后同节奏重试形成新一轮脉冲。
+                var wait = e.RetryAfter is { } asked && asked > backoff ? asked : backoff;
+                wait += TimeSpan.FromMilliseconds(Random.Shared.NextDouble() * 500);
+                wait = TimeSpan.FromSeconds(Math.Min(30, wait.TotalSeconds));
+                log?.Invoke($"{what}: attempt {attempt}/{MaxAttempts} failed (HTTP {(int)e.StatusCode}, server asked {FormatAsked(e.RetryAfter)}), retrying in {wait.TotalSeconds:F1}s");
+                await Task.Delay(wait, ct);
+            }
             catch (Exception e) when (attempt < MaxAttempts)
             {
-                var delay = TimeSpan.FromSeconds(Math.Min(8, 1 << (attempt - 1))); // ≥ Shionlib 限流回复的 Retry-After: 1
+                onTransient?.Invoke(); // 空闲超时等同样视为拥塞信号
+                var delay = TimeSpan.FromSeconds(Math.Min(8, 1 << (attempt - 1)));
+                delay += TimeSpan.FromMilliseconds(Random.Shared.NextDouble() * 500);
                 var reason = e is OperationCanceledException ? "idle timeout" : $"{e.GetType().Name}: {e.Message}";
-                log?.Invoke($"{what}: attempt {attempt}/{MaxAttempts} failed ({reason}), retrying in {delay.TotalSeconds:F0}s");
+                log?.Invoke($"{what}: attempt {attempt}/{MaxAttempts} failed ({reason}), retrying in {delay.TotalSeconds:F1}s");
                 await Task.Delay(delay, ct);
             }
         }
     }
 
-    private Task RetryAsync(Func<Task> action, CancellationToken ct, Action<string>? log, string what) =>
+    private static string FormatAsked(TimeSpan? asked) =>
+        asked is { } value ? $"{value.TotalSeconds:F0}s" : "n/a";
+
+    private Task RetryAsync(Func<Task> action, CancellationToken ct, Action<string>? log, string what,
+        Action? onTransient = null, Action? onResponse = null) =>
         RetryAsync(async () =>
         {
             await action();
             return 0;
-        }, ct, log, what);
+        }, ct, log, what, onTransient, onResponse);
 
     /// <summary>多线程分块下载：每个连接认领块，按 Range 写入文件对应偏移。</summary>
     private async Task DownloadChunkedAsync(InstallRequest request, string partPath,
@@ -488,6 +551,14 @@ public class DownloadService : IDisposable
             ? ReadWatermark(watermarkPath, Math.Min(totalBytes, new FileInfo(partPath).Length)) : 0;
         var completed = new bool[chunkCount];
         var offsets = new long[chunkCount]; // 每块下一个未写入的位置，只有认领该块的 worker 会推进
+        var inFlight = new bool[chunkCount]; // 块正被某个 worker 下载（掉队扫描用）
+        var chunkStartTicks = new long[chunkCount]; // 块本次认领的时间戳（掉队年龄用）
+        var handoffSeq = new long[chunkCount]; // 接管代次：thief 每次认领 +1，原连接凭此发现自己被取代
+        var handoffs = new int[chunkCount]; // 单块累计被接管次数，超限后不再换连接
+        var lastHandoffTicks = new long[chunkCount]; // 上次接管时间，接管之间也要间隔
+        var attemptCts = new CancellationTokenSource?[chunkCount]; // 各块当前请求的取消柄，供接管者取消慢连接
+        var completedCount = 0;
+        _handoffCount = 0;
         var received = contiguous; // 包含旧水位在新块中间的部分，不因调整块大小而重下已有前缀
         var pending = new ConcurrentQueue<int>();
         for (var i = 0; i < chunkCount; i++)
@@ -496,6 +567,7 @@ public class DownloadService : IDisposable
             if (ChunkEnd(i, chunkSize, totalBytes) < contiguous)
             {
                 completed[i] = true;
+                completedCount++;
             }
             else
             {
@@ -517,53 +589,196 @@ public class DownloadService : IDisposable
         using var abort = CancellationTokenSource.CreateLinkedTokenSource(ct);
         var token = abort.Token;
         var nextContiguousChunk = 0;
+        var tailPhase = false;
         var gate = new object();
         var progressGate = new object();
-        var workers = new Task[Math.Clamp(pending.Count, 1, MaxConnections)];
-        for (var w = 0; w < workers.Length; w++)
-            workers[w] = Task.Run(async () =>
+        using var throttle = new AimdThrottle();
+
+        void MarkInFlight(int chunkIndex)
+        {
+            lock (gate)
             {
-                try
+                inFlight[chunkIndex] = true;
+                chunkStartTicks[chunkIndex] = Stopwatch.GetTimestamp();
+            }
+        }
+
+        void FinishChunk(int chunkIndex)
+        {
+            lock (gate)
+            {
+                inFlight[chunkIndex] = false;
+                completed[chunkIndex] = true;
+                completedCount++;
+                while (nextContiguousChunk < chunkCount && completed[nextContiguousChunk])
+                    nextContiguousChunk++;
+                var reached = nextContiguousChunk == chunkCount
+                    ? totalBytes
+                    : ChunkStart(nextContiguousChunk, chunkSize);
+                if (reached > contiguous)
                 {
-                    while (pending.TryDequeue(out var chunkIndex))
+                    contiguous = reached;
+                    SaveWatermark(watermarkPath, contiguous);
+                }
+                Monitor.PulseAll(gate);
+            }
+        }
+
+        void AbandonChunk(int chunkIndex)
+        {
+            // 被接管：已写前缀保留（offsets 已推进），未写后缀重新入队由新连接下载
+            lock (gate)
+            {
+                inFlight[chunkIndex] = false;
+                pending.Enqueue(chunkIndex);
+                Monitor.PulseAll(gate);
+            }
+        }
+
+        bool IsSuperseded(int chunkIndex, long seq)
+        {
+            if (token.IsCancellationRequested) return false; // 中止/调用方取消走原有路径
+            lock (gate) return handoffSeq[chunkIndex] != seq;
+        }
+
+        // 队列已空时找最值得救援的掉队块：跑得够久、剩得够多、接管未超限。调用方需持有 gate。
+        bool TryClaimHandoffLocked()
+        {
+            var best = -1;
+            var bestRemaining = HandoffMinBytes;
+            for (var i = 0; i < chunkCount; i++)
+            {
+                if (!inFlight[i] || completed[i] || handoffs[i] >= MaxHandoffsPerChunk) continue;
+                if (Stopwatch.GetElapsedTime(chunkStartTicks[i]) < MinHandoffAge) continue;
+                if (Stopwatch.GetElapsedTime(lastHandoffTicks[i]) < MinHandoffAge) continue;
+                var remaining = ChunkEnd(i, chunkSize, totalBytes) + 1 - Volatile.Read(ref offsets[i]);
+                if (remaining > bestRemaining)
+                {
+                    bestRemaining = remaining;
+                    best = i;
+                }
+            }
+            if (best < 0) return false;
+            handoffs[best]++;
+            handoffSeq[best]++;
+            lastHandoffTicks[best] = Stopwatch.GetTimestamp();
+            try { attemptCts[best]?.Cancel(); }
+            catch (ObjectDisposedException) { /* 刚好在收尾，abandon 路径会处理 */ }
+            Interlocked.Increment(ref _handoffCount);
+            log?.Invoke($"chunk {best}: straggler handoff #{handoffs[best]} ({bestRemaining / 1024 / 1024} MiB left)");
+            return true;
+        }
+
+        // 全部预完成（超长 .part 残留的极端情况）：跳过 worker，直接落盘搬运
+        Task[] workers = [];
+        if (pending.Count > 0)
+        {
+            workers = new Task[Math.Clamp(pending.Count, 1, HardMaxConnections)];
+            for (var w = 0; w < workers.Length; w++)
+                workers[w] = Task.Run(async () =>
+                {
+                    try
                     {
-                        token.ThrowIfCancellationRequested();
-                        var end = ChunkEnd(chunkIndex, chunkSize, totalBytes);
-                        // 瞬时断流保留本块已经写好的字节，下一次只请求剩余部分；整块回退会把 UI 的速度增量拉成负数。
-                        await RetryAsync(() => DownloadChunkAsync(request.Url, handle, offsets[chunkIndex], end, totalBytes,
-                                delta =>
-                                {
-                                    offsets[chunkIndex] += delta;
-                                    // Interlocked.Add 后再回调仍可能乱序，计数和通知必须在同一临界区内完成。
-                                    lock (progressGate)
-                                    {
-                                        received += delta;
-                                        onProgress?.Invoke(received, totalBytes);
-                                    }
-                                }, token),
-                            token, log, $"chunk {chunkIndex}");
-                        lock (gate)
+                        while (true)
                         {
-                            completed[chunkIndex] = true;
-                            while (nextContiguousChunk < chunkCount && completed[nextContiguousChunk])
-                                nextContiguousChunk++;
-                            var reached = nextContiguousChunk == chunkCount
-                                ? totalBytes
-                                : ChunkStart(nextContiguousChunk, chunkSize);
-                            if (reached > contiguous)
+                            token.ThrowIfCancellationRequested();
+                            if (pending.TryDequeue(out var chunkIndex))
                             {
-                                contiguous = reached;
-                                SaveWatermark(watermarkPath, contiguous);
+                                var end = ChunkEnd(chunkIndex, chunkSize, totalBytes);
+                                await throttle.AcquireAsync(token);
+                                try
+                                {
+                                    MarkInFlight(chunkIndex);
+                                    try
+                                    {
+                                        // 瞬时断流保留本块已经写好的字节，下一次只请求剩余部分；整块回退会把 UI 的速度增量拉成负数。
+                                        await RetryAsync(async () =>
+                                        {
+                                            long seq;
+                                            var handoffCts = new CancellationTokenSource();
+                                            lock (gate)
+                                            {
+                                                seq = handoffSeq[chunkIndex];
+                                                attemptCts[chunkIndex] = handoffCts;
+                                            }
+                                            using var _ = handoffCts;
+                                            using var attemptLink = CancellationTokenSource.CreateLinkedTokenSource(token, handoffCts.Token);
+                                            try
+                                            {
+                                                await DownloadChunkAsync(request.Url, handle,
+                                                    Volatile.Read(ref offsets[chunkIndex]), end, totalBytes,
+                                                    delta =>
+                                                    {
+                                                        Interlocked.Add(ref offsets[chunkIndex], delta);
+                                                        // 计数和通知必须在同一临界区内完成，否则多线程回调会乱序。
+                                                        lock (progressGate)
+                                                        {
+                                                            received += delta;
+                                                            onProgress?.Invoke(received, totalBytes);
+                                                        }
+                                                    },
+                                                    attemptLink.Token, () => IsSuperseded(chunkIndex, seq));
+                                            }
+                                            finally
+                                            {
+                                                lock (gate)
+                                                {
+                                                    if (ReferenceEquals(attemptCts[chunkIndex], handoffCts))
+                                                        attemptCts[chunkIndex] = null;
+                                                }
+                                            }
+                                        }, token, log, $"chunk {chunkIndex}", throttle.NoteTransient, throttle.NoteResponse);
+                                    }
+                                    catch (ChunkSupersededException)
+                                    {
+                                        AbandonChunk(chunkIndex);
+                                        continue;
+                                    }
+                                    FinishChunk(chunkIndex);
+                                }
+                                catch
+                                {
+                                    abort.Cancel();
+                                    throw;
+                                }
+                                finally
+                                {
+                                    throttle.Release();
+                                }
+                            }
+                            else
+                            {
+                                // 队列空但还有块在飞：进入尾部（油门放开到 8），找掉队块接管；全部完成则退出
+                                bool allDone, claimed;
+                                lock (gate)
+                                {
+                                    if (!tailPhase)
+                                    {
+                                        tailPhase = true;
+                                        throttle.EnterTail();
+                                    }
+                                    allDone = completedCount == chunkCount;
+                                    claimed = !allDone && TryClaimHandoffLocked();
+                                }
+                                if (allDone) break;
+                                if (claimed)
+                                {
+                                    // 原连接会很快放弃并重新入队，短暂让步后回来取
+                                    await Task.Delay(500, token);
+                                    continue;
+                                }
+                                // 无可接管：等状态变化（完成/放弃会脉冲），分小片睡以便及时响应取消
+                                lock (gate) Monitor.Wait(gate, 200);
                             }
                         }
                     }
-                }
-                catch
-                {
-                    abort.Cancel();
-                    throw;
-                }
-            }, token);
+                    catch
+                    {
+                        abort.Cancel();
+                        throw;
+                    }
+                }, token);
+        }
         try
         {
             await Task.WhenAll(workers);
@@ -583,7 +798,7 @@ public class DownloadService : IDisposable
             var watermark = 0L;
             for (var i = 0; i < chunkCount; i++)
             {
-                watermark = offsets[i];
+                watermark = Volatile.Read(ref offsets[i]);
                 if (watermark < ChunkEnd(i, chunkSize, totalBytes) + 1) break;
             }
             SaveWatermark(watermarkPath, watermark);
@@ -591,44 +806,56 @@ public class DownloadService : IDisposable
     }
 
     private int GetChunkSize(long totalBytes) =>
-        (int)Math.Min(_chunkSize, Math.Max(MinimumChunkSize, (totalBytes + MaxConnections - 1) / MaxConnections));
+        (int)Math.Min(_chunkSize, Math.Max(MinimumChunkSize, (totalBytes + SteadyConnections - 1) / SteadyConnections));
 
     private static long ChunkStart(int chunkIndex, int chunkSize) => (long)chunkIndex * chunkSize;
 
     private static long ChunkEnd(int chunkIndex, int chunkSize, long totalBytes) =>
         Math.Min((long)(chunkIndex + 1) * chunkSize, totalBytes) - 1;
 
-    /// <summary>下载分块尚未写入的范围。<paramref name="report"/> 每次写入报告正增量，失败重试保留此前已写的前缀。</summary>
+    /// <summary>
+    /// 下载分块尚未写入的范围。<paramref name="report"/> 每次写入报告正增量，失败重试保留此前已写的前缀。
+    /// <paramref name="isSuperseded"/> 为接管探测：返回 true 说明本块已被别的连接接管，当前慢连接应停下让路。
+    /// </summary>
     private async Task DownloadChunkAsync(string url, SafeFileHandle handle,
-        long start, long end, long expectedTotal, Action<long> report, CancellationToken ct)
+        long start, long end, long expectedTotal, Action<long> report, CancellationToken ct,
+        Func<bool>? isSuperseded = null)
     {
         if (start > end) return;
-        using var idle = CreateIdleCts(ct);
-        using var request = new HttpRequestMessage(HttpMethod.Get, url);
-        request.Headers.Range = new RangeHeaderValue(start, end);
-        using var response = await SendAsync(request, idle.Token);
-        if (response.StatusCode != HttpStatusCode.PartialContent)
+        try
         {
-            ThrowIfFailed(response);
-            throw new DownloadException($"服务器未按 Range 返回分块（状态码 {(int)response.StatusCode}）");
-        }
-        ValidateRangeResponse(response, start, end, expectedTotal);
-        var length = end - start + 1;
+            using var idle = CreateIdleCts(ct);
+            using var request = new HttpRequestMessage(HttpMethod.Get, url);
+            request.Headers.Range = new RangeHeaderValue(start, end);
+            using var response = await SendAsync(request, idle.Token);
+            if (response.StatusCode != HttpStatusCode.PartialContent)
+            {
+                ThrowIfFailed(response);
+                throw new DownloadException($"服务器未按 Range 返回分块（状态码 {(int)response.StatusCode}）");
+            }
+            ValidateRangeResponse(response, start, end, expectedTotal);
+            var length = end - start + 1;
 
-        await using var contentStream = await response.Content.ReadAsStreamAsync(idle.Token);
-        var buffer = new byte[BufferSize];
-        var written = 0L;
-        int read;
-        while (written < length && (read = await ReadAsync(contentStream, buffer, idle)) > 0)
-        {
-            if (written + read > length)
-                throw new DownloadException("服务器返回的数据超出请求的分块范围");
-            await RandomAccess.WriteAsync(handle, buffer.AsMemory(0, read), start + written, ct);
-            written += read;
-            report(read);
+            await using var contentStream = await response.Content.ReadAsStreamAsync(idle.Token);
+            var buffer = new byte[BufferSize];
+            var written = 0L;
+            int read;
+            while (written < length && (read = await ReadAsync(contentStream, buffer, idle)) > 0)
+            {
+                if (written + read > length)
+                    throw new DownloadException("服务器返回的数据超出请求的分块范围");
+                await RandomAccess.WriteAsync(handle, buffer.AsMemory(0, read), start + written, ct);
+                written += read;
+                report(read);
+            }
+            if (written < length)
+                throw new IOException($"分块数据不完整，还差 {length - written} 字节");
         }
-        if (written < length)
-            throw new IOException($"分块数据不完整，还差 {length - written} 字节");
+        catch (OperationCanceledException) when (isSuperseded?.Invoke() == true)
+        {
+            // 接管取消（非中止、非调用方取消、非空闲超时）：块会重新入队，绕过重试直接上抛改道
+            throw new ChunkSupersededException();
+        }
     }
 
     /// <summary>单连接顺序下载：服务器不支持 Range 时的退化方案（可断点续传，重试时按水位续传）。</summary>
@@ -886,3 +1113,122 @@ public class DownloadService : IDisposable
 }
 
 public class DownloadException(string message) : Exception(message);
+
+/// <summary>瞬时 HTTP 错误（408/429/5xx）：携带服务端建议的等待时间，可重试。</summary>
+internal sealed class TransientHttpException(string message, HttpStatusCode statusCode, TimeSpan? retryAfter)
+    : HttpRequestException(message, null, statusCode)
+{
+    public new HttpStatusCode StatusCode { get; } = statusCode;
+    public TimeSpan? RetryAfter { get; } = retryAfter;
+}
+
+/// <summary>块被掉队接管：原连接已太慢，块会重新入队由新连接下载。必须绕过重试直接上抛，由 worker 改道，不算失败。</summary>
+internal sealed class ChunkSupersededException : Exception;
+
+/// <summary>
+/// AIMD 自适应并发油门：稳态 6、上限 8、下限 2。实现为上限 8 的信号量＋扣留池——
+/// 降速时把空闲许可扣进池（不够扣就等 worker 归还时吸收），恢复时再放出来，增减都不阻塞。
+/// 见 429/503/超时降 2 格，连续 20 个成功响应回 1 格；尾部调用 <see cref="EnterTail"/> 放开到 8。
+/// </summary>
+internal sealed class AimdThrottle : IDisposable
+{
+    public const int SteadyConnections = 6;
+    public const int HardMaxConnections = 8;
+    public const int MinConnections = 2;
+    private const int ResponsesPerStep = 20;
+
+    private readonly SemaphoreSlim _gate = new(HardMaxConnections, HardMaxConnections);
+    private readonly object _sync = new();
+    private int _parked = HardMaxConnections - SteadyConnections;
+    private int _targetParked = HardMaxConnections - SteadyConnections;
+    private int _floorParked = HardMaxConnections - SteadyConnections;
+    private int _inUse;
+    private int _streak;
+    private bool _disposed;
+
+    public AimdThrottle()
+    {
+        for (var i = 0; i < _parked; i++) _gate.Wait(); // 初始一定有空位，不阻塞
+    }
+
+    /// <summary>当前可被认领的并发数（扣留＋占用之外）。</summary>
+    public int Available
+    {
+        get { lock (_sync) return HardMaxConnections - _parked - _inUse; }
+    }
+
+    public int TransientEvents
+    {
+        get { lock (_sync) return _transientEvents; }
+    }
+    private int _transientEvents;
+
+    public async Task AcquireAsync(CancellationToken ct)
+    {
+        await _gate.WaitAsync(ct);
+        lock (_sync) _inUse++;
+    }
+
+    /// <summary>归还许可：正处降速期则被扣留池吸收，否则回到信号量。</summary>
+    public void Release()
+    {
+        lock (_sync)
+        {
+            _inUse--;
+            if (_parked < _targetParked) _parked++;
+            else _gate.Release();
+        }
+    }
+
+    public void NoteTransient()
+    {
+        lock (_sync)
+        {
+            _transientEvents++;
+            _streak = 0;
+            _targetParked = Math.Min(HardMaxConnections - MinConnections, _targetParked + 2);
+            while (_parked < _targetParked && _gate.Wait(0)) _parked++;
+        }
+    }
+
+    public void NoteResponse()
+    {
+        lock (_sync)
+        {
+            if (++_streak < ResponsesPerStep) return;
+            _streak = 0;
+            if (_targetParked <= _floorParked) return;
+            _targetParked--;
+            if (_parked > _targetParked)
+            {
+                _parked--;
+                _gate.Release();
+            }
+        }
+    }
+
+    /// <summary>进入尾部：恢复下限清零并立即放出全部扣留，让空闲连接参与救援。</summary>
+    public void EnterTail()
+    {
+        lock (_sync)
+        {
+            _floorParked = 0;
+            _targetParked = 0;
+            while (_parked > 0)
+            {
+                _parked--;
+                _gate.Release();
+            }
+        }
+    }
+
+    public void Dispose()
+    {
+        lock (_sync)
+        {
+            if (_disposed) return;
+            _disposed = true;
+        }
+        _gate.Dispose();
+    }
+}

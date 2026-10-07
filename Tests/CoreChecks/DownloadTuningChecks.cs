@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.IO;
 using System.Linq;
 using System.Net;
@@ -36,6 +37,9 @@ internal static class DownloadTuningChecks
         await CheckSequentialRangeMismatchAsync(directory, payload, check);
         await CheckMissingTotalAsync(directory, payload, check);
         await CheckNoHashReuseAsync(directory, payload, check);
+        await CheckRetryAfterAsync(directory, payload, check);
+        CheckAimdThrottle(check);
+        await CheckHandoffAsync(directory, payload, check);
     }
 
     private static async Task CheckRetryAsync(string directory, byte[] payload, Action<bool, string> check)
@@ -392,6 +396,97 @@ internal static class DownloadTuningChecks
             check(error is null && Matches(unconfirmedTarget, payload) && unconfirmedRequests.Count > 1,
                 $"download integrity: unconfirmed length is not treated as complete, normal download follows ({error?.Message}, {unconfirmedRequests.Count} requests)");
         }
+    }
+
+    private static async Task CheckRetryAfterAsync(string directory, byte[] payload, Action<bool, string> check)
+    {
+        // 服务端明确要求等 3 秒：必须遵守 Retry-After，而不是按 1s 退避立即重试
+        var attempts = 0;
+        using var handler = new Handler(request =>
+        {
+            var range = request.Headers.Range!.Ranges.Single();
+            var start = range.From!.Value;
+            var end = range.To!.Value;
+            if (start == 0 && end == 0) return Response(payload, start, end);
+            if (Interlocked.Increment(ref attempts) == 1)
+            {
+                var rejected = new HttpResponseMessage((HttpStatusCode)429);
+                rejected.Headers.RetryAfter = new RetryConditionHeaderValue(TimeSpan.FromSeconds(3));
+                return rejected;
+            }
+            return Response(payload, start, end);
+        });
+        using var service = new DownloadService(handler, TimeSpan.FromSeconds(5), payload.Length) { MaxAttempts = 2 };
+        var target = Path.Combine(directory, "retry-after.bin");
+        var watch = Stopwatch.StartNew();
+        var error = await Capture(() => service.DownloadAsync(Request(payload.Length), target));
+        watch.Stop();
+        check(error is null && Matches(target, payload),
+            $"download tail: 429 with Retry-After then success ({error?.Message})");
+        check(watch.Elapsed >= TimeSpan.FromSeconds(2.8),
+            $"download tail: Retry-After: 3 is honored instead of 1s backoff ({watch.Elapsed.TotalSeconds:F1}s)");
+    }
+
+    private static void CheckAimdThrottle(Action<bool, string> check)
+    {
+        // 油门状态机是纯内存逻辑：逐档验证，不依赖网络与计时
+        using var throttle = new AimdThrottle();
+        check(throttle.Available == 6, $"tail AIMD: starts at steady 6 (got {throttle.Available})");
+        throttle.NoteTransient();
+        check(throttle.Available == 4, $"tail AIMD: one rejection parks to 4 (got {throttle.Available})");
+        throttle.NoteTransient();
+        check(throttle.Available == 2, $"tail AIMD: storm parks to min 2 (got {throttle.Available})");
+        throttle.NoteTransient();
+        check(throttle.Available == 2, "tail AIMD: never below min 2");
+        for (var i = 0; i < 19; i++) throttle.NoteResponse();
+        check(throttle.Available == 2, "tail AIMD: 19 consecutive successes are not enough for a step up");
+        throttle.NoteResponse();
+        check(throttle.Available == 3, $"tail AIMD: 20 consecutive successes restore 1 (got {throttle.Available})");
+        throttle.EnterTail();
+        check(throttle.Available == 8, $"tail AIMD: tail phase bursts to 8 (got {throttle.Available})");
+        throttle.NoteTransient();
+        check(throttle.Available == 6 && throttle.TransientEvents == 4,
+            $"tail AIMD: congestion during tail parks again ({throttle.Available} available, {throttle.TransientEvents} events)");
+    }
+
+    private static async Task CheckHandoffAsync(string directory, byte[] payload, Action<bool, string> check)
+    {
+        // 块 0 先给 8KiB 然后卡死：空闲连接应在 30s 空闲超时之前接管，后续从 8KiB 续传而非从头重下
+        var requests = new ConcurrentQueue<long>();
+        using var handler = new Handler(request =>
+        {
+            var range = request.Headers.Range!.Ranges.Single();
+            var start = range.From!.Value;
+            var end = range.To!.Value;
+            if (start == 0 && end == 0) return Response(payload, start, end);
+            requests.Enqueue(start);
+            return start == 0
+                ? Response(payload, start, end, new InterruptedStream(payload, (int)start, (int)(end - start + 1), stall: true))
+                : Response(payload, start, end);
+        });
+        using var service = new DownloadService(handler, TimeSpan.FromSeconds(30), ChunkSize)
+        {
+            MaxAttempts = 2,
+            MinHandoffAge = TimeSpan.FromMilliseconds(500),
+            HandoffMinBytes = 4096,
+        };
+        var progress = new List<long>();
+        var target = Path.Combine(directory, "handoff.bin");
+        var watch = Stopwatch.StartNew();
+        var error = await Capture(() => service.DownloadAsync(Request(payload.Length), target,
+            (received, _) => { lock (progress) progress.Add(received); }));
+        watch.Stop();
+        check(error is null && Matches(target, payload),
+            $"download tail: stalled chunk is rescued by handoff ({error?.Message})");
+        check(service.HandoffCount >= 1,
+            $"download tail: handoff actually fired ({service.HandoffCount} handoffs in {watch.Elapsed.TotalSeconds:F1}s)");
+        check(watch.Elapsed < TimeSpan.FromSeconds(15),
+            $"download tail: no 30s idle-timeout wait ({watch.Elapsed.TotalSeconds:F1}s)");
+        check(requests.Contains(PartialBytes),
+            "download tail: rescue resumes the unwritten suffix, preserving the 8KiB prefix");
+        check(progress.Zip(progress.Skip(1)).All(pair => pair.First <= pair.Second)
+              && progress.All(value => value <= payload.Length) && progress.LastOrDefault() == payload.Length,
+            "download tail: handoff never rolls back or double counts bytes");
     }
 
     private static void TryDelete(string path)
