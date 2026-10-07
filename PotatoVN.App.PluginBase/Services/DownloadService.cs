@@ -25,6 +25,7 @@ namespace PotatoVN.App.PluginBase.Services;
 /// 中断后再次下载只重下水位之后的部分。
 /// 本类只保证落盘字节数与声明的 size 一致；哈希校验由调用方在下载完成后执行。
 /// 重试策略对齐 ReinaManager（takanawa）：网络错误/空闲超时/408/429/5xx 指数退避重试，
+/// 2xx 非 206（链路忽略 Range）按瞬时错误有限重试并携带响应指纹——现场实证它会瞬时出现；
 /// 确定性错误（越界数据、范围不符、4xx 拒绝）不重试；任一块彻底失败立即中止整个下载。
 /// </summary>
 public class DownloadService : IDisposable
@@ -38,6 +39,7 @@ public class DownloadService : IDisposable
     private const int MinConnections = 2;
     private const int DefaultMaxAttempts = 5;             // 单个请求（探测/分块/顺序）最多尝试次数
     private const int BufferSize = 81920;
+    private const long SuccessSignalBytes = 8L * 1024 * 1024; // AIMD 成功信号粒度：按字节计恢复才跟得上降档速度
     private static readonly TimeSpan DefaultIdleTimeout = TimeSpan.FromSeconds(60);
 
     private const int MaxRedirects = 5;           // 手动跟随重定向的最大跳数（自动重定向已关，每跳都要过守卫）
@@ -59,7 +61,8 @@ public class DownloadService : IDisposable
     /// <summary>掉队接管的最小块内剩余量（测试用）：小于此值的慢尾由原连接跑完，不值得换连接。</summary>
     internal long HandoffMinBytes { get; init; } = 8L * 1024 * 1024;
 
-    /// <summary>掉队接管的最小时长（测试用）：块认领后经过这么久仍未完成，且队列已空，才允许换连接接管。</summary>
+    /// <summary>掉队接管的最小时长（测试用）：块内连续这么久没有任何新字节落盘（真停滞，而非正常慢），
+    /// 且队列已空，才允许换连接接管。只看认领时长会把正常慢连接也掐断重连，面板上就是速度反复掉底再冲高。</summary>
     internal TimeSpan MinHandoffAge { get; init; } = TimeSpan.FromSeconds(10);
 
     /// <summary>单块最多被接管次数（测试用）：超限后不再换连接，避免在持续慢源上空转租约。</summary>
@@ -323,7 +326,16 @@ public class DownloadService : IDisposable
             }
             if (!reusedCompletePart)
             {
-                if (await ProbeRangeAsync(request.Url, totalBytes, ct, log))
+                var rangeSupported = await ProbeRangeAsync(request.Url, totalBytes, ct, log);
+                if (!rangeSupported)
+                {
+                    // 同一 URL 的探测结果会翻转（现场实证 5 分钟内否→是→否）。一次「不支持」就把大文件
+                    // 压进单连接顺序模式（实机 ~1.2MB/s，分块能到 13MB/s+），代价太大——再探一次，
+                    // 两次都不支持才退化；第一次的 200 响应指纹已由 ProbeRangeAsync 写进日志。
+                    log?.Invoke("probe: range NOT supported, re-probing once");
+                    rangeSupported = await ProbeRangeAsync(request.Url, totalBytes, ct, log);
+                }
+                if (rangeSupported)
                 {
                     var chunkSize = GetChunkSize(totalBytes);
                     log?.Invoke($"probe: range supported, chunked download ({(totalBytes + chunkSize - 1) / chunkSize} chunks, steady {SteadyConnections} up to {HardMaxConnections} tail connections, chunk size {chunkSize} bytes)");
@@ -388,7 +400,10 @@ public class DownloadService : IDisposable
                 return true;
             }
             ThrowIfFailed(response);
-            return false; // 2xx 但没按 Range 返回：服务器不支持 Range
+            // 2xx 但没按 Range 返回：不支持（或被中间层剥了 Range）。把响应指纹写进日志——
+            // 「同一 URL 探测结果翻转」的现场里，这行指纹是唯一能指出是谁在答 200 的证据。
+            log?.Invoke("probe: " + await UnexpectedChunkResponseMessage(response, 0, 0, idle.Token));
+            return false;
         }, ct, log, "probe");
 
     /// <summary>非成功状态码分类：408/429/5xx 是瞬时错误（进入重试），其余直接判定失败。</summary>
@@ -477,7 +492,7 @@ public class DownloadService : IDisposable
 
     /// <summary>
     /// 瞬时错误重试（对齐 takanawa：指数退避 1/2/4/8s，并遵守服务端 Retry-After）。
-    /// 网络错误、空闲超时、408/429/5xx 可重试；调用方取消、接管冲突与
+    /// 网络错误、空闲超时、408/429/5xx 与 2xx 非 206（链路忽略 Range）可重试；调用方取消、接管冲突与
     /// <see cref="DownloadException"/>（确定性错误）立即抛出。
     /// <paramref name="onTransient"/> 每次瞬时失败调用一次（AIMD 降速信号），
     /// <paramref name="onResponse"/> 每次成功响应调用一次（AIMD 恢复信号）。
@@ -553,7 +568,8 @@ public class DownloadService : IDisposable
         var completed = new bool[chunkCount];
         var offsets = new long[chunkCount]; // 每块下一个未写入的位置，只有认领该块的 worker 会推进
         var inFlight = new bool[chunkCount]; // 块正被某个 worker 下载（掉队扫描用）
-        var chunkStartTicks = new long[chunkCount]; // 块本次认领的时间戳（掉队年龄用）
+        var chunkStartTicks = new long[chunkCount]; // 块本次认领的时间戳（完成耗时日志用）
+        var lastProgressTicks = new long[chunkCount]; // 最近一次有新字节落盘的时间：掉队判据是「真停滞」而不是「跑得久」
         var handoffSeq = new long[chunkCount]; // 接管代次：thief 每次认领 +1，原连接凭此发现自己被取代
         var handoffs = new int[chunkCount]; // 单块累计被接管次数，超限后不再换连接
         var lastHandoffTicks = new long[chunkCount]; // 上次接管时间，接管之间也要间隔
@@ -561,6 +577,7 @@ public class DownloadService : IDisposable
         var completedCount = 0;
         _handoffCount = 0;
         var received = contiguous; // 包含旧水位在新块中间的部分，不因调整块大小而重下已有前缀
+        var successBytes = 0L; // AIMD 成功信号累计（progressGate 保护）
         var pending = new ConcurrentQueue<int>();
         for (var i = 0; i < chunkCount; i++)
         {
@@ -601,6 +618,7 @@ public class DownloadService : IDisposable
             {
                 inFlight[chunkIndex] = true;
                 chunkStartTicks[chunkIndex] = Stopwatch.GetTimestamp();
+                Volatile.Write(ref lastProgressTicks[chunkIndex], chunkStartTicks[chunkIndex]);
             }
         }
 
@@ -642,7 +660,8 @@ public class DownloadService : IDisposable
             lock (gate) return handoffSeq[chunkIndex] != seq;
         }
 
-        // 队列已空时找最值得救援的掉队块：跑得够久、剩得够多、接管未超限。调用方需持有 gate。
+        // 队列已空时找最值得救援的掉队块：连续 MinHandoffAge 没有任何新字节落盘（真停滞）、
+        // 剩得够多、接管未超限。调用方需持有 gate。
         bool TryClaimHandoffLocked()
         {
             var best = -1;
@@ -650,7 +669,8 @@ public class DownloadService : IDisposable
             for (var i = 0; i < chunkCount; i++)
             {
                 if (!inFlight[i] || completed[i] || handoffs[i] >= MaxHandoffsPerChunk) continue;
-                if (Stopwatch.GetElapsedTime(chunkStartTicks[i]) < MinHandoffAge) continue;
+                if (attemptCts[i] is null) continue; // 正在退避重试的块由自己的重试换连接，接管只会空转
+                if (Stopwatch.GetElapsedTime(Volatile.Read(ref lastProgressTicks[i])) < MinHandoffAge) continue;
                 if (Stopwatch.GetElapsedTime(lastHandoffTicks[i]) < MinHandoffAge) continue;
                 var remaining = ChunkEnd(i, chunkSize, totalBytes) + 1 - Volatile.Read(ref offsets[i]);
                 if (remaining > bestRemaining)
@@ -666,7 +686,7 @@ public class DownloadService : IDisposable
             try { attemptCts[best]?.Cancel(); }
             catch (ObjectDisposedException) { /* 刚好在收尾，abandon 路径会处理 */ }
             Interlocked.Increment(ref _handoffCount);
-            log?.Invoke($"chunk {best}: straggler handoff #{handoffs[best]} ({bestRemaining / 1024 / 1024} MiB left)");
+            log?.Invoke($"chunk {best}: straggler handoff #{handoffs[best]} (no progress for {Stopwatch.GetElapsedTime(Volatile.Read(ref lastProgressTicks[best])).TotalSeconds:F0}s, {bestRemaining / 1024 / 1024} MiB left)");
             return true;
         }
 
@@ -716,6 +736,14 @@ public class DownloadService : IDisposable
                                                         {
                                                             received += delta;
                                                             onProgress?.Invoke(received, totalBytes);
+                                                            Volatile.Write(ref lastProgressTicks[chunkIndex], Stopwatch.GetTimestamp());
+                                                            // 成功信号按字节计：按「块完成」计要收满 20 块（>1GiB）才回升一档，
+                                                            // 撞一次 429/断流就要十几分钟爬回来，实际等于永不恢复
+                                                            if ((successBytes += delta) >= SuccessSignalBytes)
+                                                            {
+                                                                successBytes -= SuccessSignalBytes;
+                                                                throttle.NoteResponse();
+                                                            }
                                                         }
                                                     },
                                                     attemptLink.Token, () => IsSuperseded(chunkIndex, seq));
@@ -736,6 +764,8 @@ public class DownloadService : IDisposable
                                         continue;
                                     }
                                     FinishChunk(chunkIndex);
+                                    // 完成耗时日志：配合 30s 心跳，事后能从日志还原秒级吞吐（诊断速度波动）
+                                    log?.Invoke($"chunk {chunkIndex}: done in {Stopwatch.GetElapsedTime(chunkStartTicks[chunkIndex]).TotalSeconds:F1}s");
                                 }
                                 catch
                                 {
@@ -832,7 +862,11 @@ public class DownloadService : IDisposable
             if (response.StatusCode != HttpStatusCode.PartialContent)
             {
                 ThrowIfFailed(response);
-                throw new DownloadException(await UnexpectedChunkResponseMessage(response, start, end, idle.Token));
+                // 2xx 非 206：链路中某层忽略了 Range。现场实证它是瞬时故障（连接风暴后紧跟一次 200，
+                // 重新推送即恢复），所以按瞬时错误有限重试；响应体是整份文件，绝不能落到块偏移上。
+                // 指纹（Server/CF-Ray/正文前缀）随消息走：重试耗尽后它进历史与 log.txt，用于定位责任层。
+                throw new TransientHttpException(await UnexpectedChunkResponseMessage(response, start, end, idle.Token),
+                    response.StatusCode, ParseRetryAfter(response));
             }
             ValidateRangeResponse(response, start, end, expectedTotal);
             var length = end - start + 1;
@@ -863,6 +897,7 @@ public class DownloadService : IDisposable
     /// 分块请求收到 2xx 非 206：链路中某层忽略了 Range。把响应指纹（服务器标识、缓存年龄、
     /// 声明长度、正文前缀）带进错误消息——正文前缀是压缩包魔数说明对方在发完整文件，是
     /// JSON/HTML 则是代理/安全软件的错误页。消息会进任务历史与 log.txt，是定位责任层的依据。
+    /// 抛给调用方的是 <see cref="TransientHttpException"/>（有限重试），消息只在重试耗尽后随失败落盘。
     /// </summary>
     private static async Task<string> UnexpectedChunkResponseMessage(HttpResponseMessage response,
         long start, long end, CancellationToken ct)
@@ -1171,7 +1206,8 @@ internal sealed class ChunkSupersededException : Exception;
 /// <summary>
 /// AIMD 自适应并发油门：稳态 6、上限 8、下限 2。实现为上限 8 的信号量＋扣留池——
 /// 降速时把空闲许可扣进池（不够扣就等 worker 归还时吸收），恢复时再放出来，增减都不阻塞。
-/// 见 429/503/超时降 2 格，连续 20 个成功响应回 1 格；尾部调用 <see cref="EnterTail"/> 放开到 8。
+/// 见 429/503/超时降 2 格；连续 20 个成功信号回 1 格——分块下载每收满 8MiB 报一次（块完成再报一次），
+/// 按「块完成」计的话恢复要收满 20 个 64MiB 块，一次限流就得爬十几分钟。尾部调用 <see cref="EnterTail"/> 放开到 8。
 /// </summary>
 internal sealed class AimdThrottle : IDisposable
 {

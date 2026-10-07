@@ -226,9 +226,11 @@ internal static class Program
         Check(e8 is DownloadException && e8.Message.Contains("空闲超时") && watch.Elapsed < TimeSpan.FromSeconds(15),
             $"download: idle timeout aborts a stalled server in {watch.Elapsed.TotalSeconds:F1}s ({e8?.Message})");
 
-        // 9. 探测回 206 但分块请求回 200
+        // 9. 探测回 206 但分块请求回 200：按瞬时错误有限重试（现场实证会瞬时出现），耗尽后拒绝且不落盘
         var e9 = await Throws(() => NewService().DownloadAsync(R("rangebroken"), Target("rb.bin")));
-        Check(e9 is DownloadException && e9.Message.Contains("未按 Range"), $"download: chunk request answered with 200 is rejected ({e9?.Message})");
+        Check(e9 is HttpRequestException && e9.Message.Contains("未按 Range") && e9.Message.Contains("200"),
+            $"download: chunk request answered with 200 is retried then rejected ({e9?.Message})");
+        Check(!File.Exists(Target("rb.bin")), "download: 200 full-file answer is never promoted to the final file");
 
         // 9b. 限流（429）与 5xx 是瞬时错误：退避重试后成功，内容完整（Shionlib 代理超并发即回 429 + Retry-After: 1）
         server.ResetCounters();

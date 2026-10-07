@@ -41,6 +41,8 @@ internal static class DownloadTuningChecks
         await CheckChunkFullResponseAsync(directory, payload, check);
         CheckAimdThrottle(check);
         await CheckHandoffAsync(directory, payload, check);
+        await CheckHandoffHealthyAsync(directory, payload, check);
+        await CheckFlakyProbeAsync(directory, payload, check);
     }
 
     private static async Task CheckRetryAsync(string directory, byte[] payload, Action<bool, string> check)
@@ -401,29 +403,54 @@ internal static class DownloadTuningChecks
 
     private static async Task CheckChunkFullResponseAsync(string directory, byte[] payload, Action<bool, string> check)
     {
-        // 中间设备无视 Range 直接回 200 全量：必须拒绝，且错误消息要带响应指纹（Server/请求范围），
-        // 现场指纹是事后定位"哪一层忽略了 Range"的唯一依据
-        var target = Path.Combine(directory, "chunk-200.bin");
-        using var handler = new Handler(request =>
+        // 中间设备无视 Range 直接回 200 全量：绝不能把整份文件落到块偏移上；但现场实证它会瞬时出现
+        // （连接风暴后紧跟一次 200，重推即恢复），所以按瞬时错误有限重试，耗尽才失败，
+        // 且错误消息要带响应指纹（Server/请求范围），那是事后定位"哪一层忽略了 Range"的唯一依据
+        var attempts = 0;
+        using (var handler = new Handler(request =>
         {
             var range = request.Headers.Range!.Ranges.Single();
             var start = range.From!.Value;
             var end = range.To!.Value;
             if (start == 0 && end == 0) return Response(payload, start, end);
+            Interlocked.Increment(ref attempts);
             var full = new HttpResponseMessage(HttpStatusCode.OK)
             {
                 Content = new ByteArrayContent(payload),
             };
             full.Headers.TryAddWithoutValidation("Server", "test-edge");
             return full;
-        });
-        using var service = Service(handler);
-        var error = await Capture(() => service.DownloadAsync(Request(payload.Length), target));
-        check(error is DownloadException && error.Message.Contains("200") && error.Message.Contains("bytes=")
-              && error.Message.Contains("test-edge"),
-            $"download integrity: chunk answered 200 full file is rejected with response fingerprint ({error?.Message})");
-        check(!File.Exists(target),
-            "download integrity: 200 full-file answer is not promoted to final file");
+        }))
+        using (var service = Service(handler))
+        {
+            var target = Path.Combine(directory, "chunk-200.bin");
+            var error = await Capture(() => service.DownloadAsync(Request(payload.Length), target));
+            check(error is not null && error.Message.Contains("200") && error.Message.Contains("bytes=")
+                  && error.Message.Contains("test-edge") && attempts >= 2,
+                $"download integrity: persistent 200 full-file answer is retried then rejected with fingerprint ({error?.Message}, {attempts} attempts)");
+            check(!File.Exists(target),
+                "download integrity: 200 full-file answer is not promoted to final file");
+        }
+
+        // 瞬时 200 后恢复：同一个块重试一次就拿到 206，下载必须完整完成
+        var transientRequests = 0;
+        using (var handler = new Handler(request =>
+        {
+            var range = request.Headers.Range!.Ranges.Single();
+            var start = range.From!.Value;
+            var end = range.To!.Value;
+            if (start == 0 && end == 0) return Response(payload, start, end);
+            if (Interlocked.Increment(ref transientRequests) == 1)
+                return new HttpResponseMessage(HttpStatusCode.OK) { Content = new ByteArrayContent(payload) };
+            return Response(payload, start, end);
+        }))
+        using (var service = Service(handler))
+        {
+            var target = Path.Combine(directory, "chunk-200-recover.bin");
+            var error = await Capture(() => service.DownloadAsync(Request(payload.Length), target));
+            check(error is null && Matches(target, payload) && transientRequests >= 2,
+                $"download integrity: transient 200 full-file answer recovers on retry ({error?.Message}, {transientRequests} requests)");
+        }
     }
 
     private static async Task CheckRetryAfterAsync(string directory, byte[] payload, Action<bool, string> check)
@@ -517,6 +544,68 @@ internal static class DownloadTuningChecks
             "download tail: handoff never rolls back or double counts bytes");
     }
 
+    private static async Task CheckHandoffHealthyAsync(string directory, byte[] payload, Action<bool, string> check)
+    {
+        // 慢但持续有进展的块不是掉队块：接管判据必须是「连续无进展」。只看认领时长的话，正常速度的块
+        // （真机上 64MiB 块要跑 20-30s）会在收尾阶段被反复掐断重连——每次换连接就是一段零速度加一次
+        // 重连尖峰，面板上表现为速度反复掉底再冲高。
+        var requests = new ConcurrentQueue<long>();
+        using var handler = new Handler(request =>
+        {
+            var range = request.Headers.Range!.Ranges.Single();
+            var start = range.From!.Value;
+            var end = range.To!.Value;
+            if (start == 0 && end == 0) return Response(payload, start, end);
+            requests.Enqueue(start);
+            return start == 0
+                ? Response(payload, start, end, new SlowStream(payload, (int)start, (int)(end - start + 1)))
+                : Response(payload, start, end);
+        });
+        using var service = new DownloadService(handler, TimeSpan.FromSeconds(30), ChunkSize)
+        {
+            MaxAttempts = 2,
+            MinHandoffAge = TimeSpan.FromSeconds(1),
+            HandoffMinBytes = 4096,
+        };
+        var target = Path.Combine(directory, "handoff-healthy.bin");
+        var error = await Capture(() => service.DownloadAsync(Request(payload.Length), target));
+        check(error is null && Matches(target, payload),
+            $"download tail: slow but progressing chunk completes ({error?.Message})");
+        check(service.HandoffCount == 0,
+            $"download tail: healthy slow chunk is not handed off ({service.HandoffCount} handoffs)");
+        check(requests.Count == 4,
+            $"download tail: every chunk keeps its original connection ({requests.Count} chunk requests)");
+    }
+
+    private static async Task CheckFlakyProbeAsync(string directory, byte[] payload, Action<bool, string> check)
+    {
+        // 同一 URL 的探测结果会翻转（现场实证：5 分钟内否→是→否）。首次探测答 200 时必须再探一次，
+        // 不能一次「不支持」就把大文件锁进单连接顺序模式（实机 ~1.2MB/s，分块能到 13MB/s+）。
+        var probes = 0;
+        var chunked = 0;
+        using var handler = new Handler(request =>
+        {
+            var range = request.Headers.Range?.Ranges.SingleOrDefault();
+            if (range is null)
+                return new HttpResponseMessage(HttpStatusCode.OK) { Content = new ByteArrayContent(payload) };
+            if (range.From == 0 && range.To == 0)
+            {
+                return Interlocked.Increment(ref probes) == 1
+                    ? new HttpResponseMessage(HttpStatusCode.OK) { Content = new ByteArrayContent([]) }
+                    : Response(payload, 0, 0);
+            }
+            Interlocked.Increment(ref chunked);
+            return Response(payload, range.From!.Value, range.To!.Value);
+        });
+        using var service = Service(handler);
+        var target = Path.Combine(directory, "flaky-probe.bin");
+        var error = await Capture(() => service.DownloadAsync(Request(payload.Length), target));
+        check(error is null && Matches(target, payload),
+            $"download tail: flaky probe still yields a complete download ({error?.Message})");
+        check(probes == 2 && chunked == 4,
+            $"download tail: first probe lie is re-probed and chunked mode wins ({probes} probes, {chunked} chunks)");
+    }
+
     private static void TryDelete(string path)
     {
         try { if (File.Exists(path)) File.Delete(path); } catch { /* ignore */ }
@@ -591,6 +680,42 @@ internal static class DownloadTuningChecks
             }
             var read = await _source.ReadAsync(buffer[..Math.Min(buffer.Length, _remaining)], cancellationToken);
             _remaining -= read;
+            return read;
+        }
+
+        public override bool CanRead => true;
+        public override bool CanSeek => false;
+        public override bool CanWrite => false;
+        public override long Length => throw new NotSupportedException();
+        public override long Position { get => throw new NotSupportedException(); set => throw new NotSupportedException(); }
+        public override int Read(byte[] buffer, int offset, int count) =>
+            ReadAsync(buffer.AsMemory(offset, count)).AsTask().GetAwaiter().GetResult();
+        public override void Flush() => throw new NotSupportedException();
+        public override long Seek(long offset, SeekOrigin origin) => throw new NotSupportedException();
+        public override void SetLength(long value) => throw new NotSupportedException();
+        public override void Write(byte[] buffer, int offset, int count) => throw new NotSupportedException();
+        protected override void Dispose(bool disposing)
+        {
+            if (disposing) _source.Dispose();
+            base.Dispose(disposing);
+        }
+    }
+
+    /// <summary>慢而稳定：每 200ms 才允许再读 8KiB，永远有进展但一个 64KiB 块要跑一秒多。</summary>
+    private sealed class SlowStream(byte[] payload, int start, int count) : Stream
+    {
+        private readonly MemoryStream _source = new(payload, start, count, writable: false);
+        private int _fed; // 已放行的字节数
+
+        public override async ValueTask<int> ReadAsync(Memory<byte> buffer, CancellationToken cancellationToken = default)
+        {
+            while (_fed <= _source.Position)
+            {
+                if (_source.Position >= count) return 0;
+                await Task.Delay(200, cancellationToken);
+                _fed = Math.Min(count, _fed + PartialBytes);
+            }
+            var read = await _source.ReadAsync(buffer[..Math.Min(buffer.Length, _fed - (int)_source.Position)], cancellationToken);
             return read;
         }
 
