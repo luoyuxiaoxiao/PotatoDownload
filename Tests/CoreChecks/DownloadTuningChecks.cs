@@ -38,6 +38,7 @@ internal static class DownloadTuningChecks
         await CheckMissingTotalAsync(directory, payload, check);
         await CheckNoHashReuseAsync(directory, payload, check);
         await CheckRetryAfterAsync(directory, payload, check);
+        await CheckChunkFullResponseAsync(directory, payload, check);
         CheckAimdThrottle(check);
         await CheckHandoffAsync(directory, payload, check);
     }
@@ -396,6 +397,33 @@ internal static class DownloadTuningChecks
             check(error is null && Matches(unconfirmedTarget, payload) && unconfirmedRequests.Count > 1,
                 $"download integrity: unconfirmed length is not treated as complete, normal download follows ({error?.Message}, {unconfirmedRequests.Count} requests)");
         }
+    }
+
+    private static async Task CheckChunkFullResponseAsync(string directory, byte[] payload, Action<bool, string> check)
+    {
+        // 中间设备无视 Range 直接回 200 全量：必须拒绝，且错误消息要带响应指纹（Server/请求范围），
+        // 现场指纹是事后定位"哪一层忽略了 Range"的唯一依据
+        var target = Path.Combine(directory, "chunk-200.bin");
+        using var handler = new Handler(request =>
+        {
+            var range = request.Headers.Range!.Ranges.Single();
+            var start = range.From!.Value;
+            var end = range.To!.Value;
+            if (start == 0 && end == 0) return Response(payload, start, end);
+            var full = new HttpResponseMessage(HttpStatusCode.OK)
+            {
+                Content = new ByteArrayContent(payload),
+            };
+            full.Headers.TryAddWithoutValidation("Server", "test-edge");
+            return full;
+        });
+        using var service = Service(handler);
+        var error = await Capture(() => service.DownloadAsync(Request(payload.Length), target));
+        check(error is DownloadException && error.Message.Contains("200") && error.Message.Contains("bytes=")
+              && error.Message.Contains("test-edge"),
+            $"download integrity: chunk answered 200 full file is rejected with response fingerprint ({error?.Message})");
+        check(!File.Exists(target),
+            "download integrity: 200 full-file answer is not promoted to final file");
     }
 
     private static async Task CheckRetryAfterAsync(string directory, byte[] payload, Action<bool, string> check)

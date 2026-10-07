@@ -9,6 +9,7 @@ using System.Net.Http.Headers;
 using System.Net.Sockets;
 using System.Runtime.ExceptionServices;
 using System.Security.Cryptography;
+using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
 using Blake3.Managed;
@@ -831,7 +832,7 @@ public class DownloadService : IDisposable
             if (response.StatusCode != HttpStatusCode.PartialContent)
             {
                 ThrowIfFailed(response);
-                throw new DownloadException($"服务器未按 Range 返回分块（状态码 {(int)response.StatusCode}）");
+                throw new DownloadException(await UnexpectedChunkResponseMessage(response, start, end, idle.Token));
             }
             ValidateRangeResponse(response, start, end, expectedTotal);
             var length = end - start + 1;
@@ -856,6 +857,48 @@ public class DownloadService : IDisposable
             // 接管取消（非中止、非调用方取消、非空闲超时）：块会重新入队，绕过重试直接上抛改道
             throw new ChunkSupersededException();
         }
+    }
+
+    /// <summary>
+    /// 分块请求收到 2xx 非 206：链路中某层忽略了 Range。把响应指纹（服务器标识、缓存年龄、
+    /// 声明长度、正文前缀）带进错误消息——正文前缀是压缩包魔数说明对方在发完整文件，是
+    /// JSON/HTML 则是代理/安全软件的错误页。消息会进任务历史与 log.txt，是定位责任层的依据。
+    /// </summary>
+    private static async Task<string> UnexpectedChunkResponseMessage(HttpResponseMessage response,
+        long start, long end, CancellationToken ct)
+    {
+        var message = new StringBuilder($"服务器未按 Range 返回分块（状态码 {(int)response.StatusCode}，请求 bytes={start}-{end}");
+        void Append(string name, string? value)
+        {
+            if (!string.IsNullOrWhiteSpace(value)) message.Append($"，{name}: {value.Trim()}");
+        }
+        Append("Server", response.Headers.Server.ToString());
+        if (response.Headers.TryGetValues("CF-Ray", out var ray)) Append("CF-Ray", string.Join(',', ray));
+        Append("Via", response.Headers.Via.ToString());
+        Append("Age", response.Headers.Age is { } age ? $"{age.TotalSeconds:F0}s" : null);
+        Append("Content-Length", response.Content.Headers.ContentLength?.ToString());
+        try
+        {
+            // 只取正文前缀：2xx 全量响应可能有数 GB，绝不能读完
+            await using var stream = await response.Content.ReadAsStreamAsync(ct);
+            var preview = new byte[64];
+            var got = 0;
+            int read;
+            while (got < preview.Length &&
+                   (read = await stream.ReadAsync(preview.AsMemory(got, preview.Length - got), ct)) > 0)
+                got += read;
+            if (got > 0)
+            {
+                var hex = Convert.ToHexString(preview.AsSpan(0, Math.Min(got, 8)));
+                var text = new string(preview.Take(got).Select(b => b is >= 32 and < 127 ? (char)b : '.').ToArray());
+                message.Append($"，正文前缀: {hex} \"{text}\"");
+            }
+        }
+        catch
+        {
+            // 取证失败不影响原始错误
+        }
+        return message.Append('）').ToString();
     }
 
     /// <summary>单连接顺序下载：服务器不支持 Range 时的退化方案（可断点续传，重试时按水位续传）。</summary>
