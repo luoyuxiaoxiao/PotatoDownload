@@ -237,6 +237,16 @@ public class PushService
                 return;
             }
 
+            // potato-vn 下非 install 的 host（如宿主自己的 oauth-bgm 登录回调）是宿主的合法激活，
+            // 与插件无关：静默跳过。若交给 InstallRequest.Parse 会走"无效推送"错误路径，
+            // 弹错误条+写 ERR 日志，用户会误判为插件故障（2026-10-08 实证）。
+            if (!string.Equals(uri.Host, InstallRequest.Host, StringComparison.OrdinalIgnoreCase))
+            {
+                _hostApi.Log(InfoBarSeverity.Informational,
+                    $"PotatoDownload: activation host={uri.Host} (not install, via {source})");
+                return;
+            }
+
             // 注意：Log 的 Informational 级别会被宿主的开发者模式开关过滤；
             // 与 potato-vn 推送直接相关的观测一律用 Warning（始终写入 log.txt）。
             // 日志里不落签名直链与压缩包密码。
