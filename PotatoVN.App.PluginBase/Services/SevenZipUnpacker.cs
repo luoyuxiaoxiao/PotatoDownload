@@ -362,12 +362,18 @@ internal static class SevenZipUnpacker
             {
                 var reason = result switch
                 {
-                    1 => "不支持的压缩算法", 2 => "数据损坏或密码不正确", 3 => "CRC 校验失败或密码不正确",
+                    1 => "压缩包使用了官方 7-Zip 不支持的算法（7z 容器内 ZSTD/LZ4/Brotli 多为 7-Zip ZS 分支产物）",
+                    2 => "数据损坏或密码不正确", 3 => "CRC 校验失败或密码不正确",
                     4 => "数据不可用", 5 => "压缩数据意外结束", 6 => "压缩数据有多余内容",
                     7 => "不是有效压缩包", 8 => "压缩包头损坏", 9 => "密码不正确",
                     _ => $"未知解压错误 {result}",
                 };
-                throw new InvalidDataException($"7z 解压失败：{reason}（{_current?.Name}）。");
+                // result==1 时 7-Zip 在拿到输出流前就失败，_current 为 null，别再拼出空括号
+                var where = _current is { } current ? $"（{current.Name}）" : "";
+                var advice = result == 1
+                    ? "压缩包已保留在下载目录的 .potatodownload 子目录，可安装 NanaZip 或 7-Zip ZS 手动解压。"
+                    : "";
+                throw new InvalidDataException($"7z 解压失败：{reason}{where}。{advice}");
             }
             if (_output is null) return;
             _session.CompleteEntry(_output.File, _current?.ModifiedTime);
