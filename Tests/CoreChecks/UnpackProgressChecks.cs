@@ -179,6 +179,21 @@ internal static class UnpackProgressChecks
             UnpackService.PrepareGameDirectory(dir, "broken-output")));
         check(corrupt is not null, $"7z {backend}: corrupted packed data is rejected");
 
+        if (OperatingSystem.IsWindows())
+        {
+            // 7z 容器内 ZSTD（7z-ZS 编码器 04 F7 11 01）：官方 7-Zip 不支持，
+            // 2026-10-08 起随包换成 ZS 分支 dll 后必须能解
+            var zstdPack = Path.Combine(dir, "zstd.7z");
+            await File.WriteAllBytesAsync(zstdPack, Convert.FromBase64String(ZstdFixture));
+            var zstdTarget = UnpackService.PrepareGameDirectory(dir, "zstd-output");
+            var zstdError = await Capture(() => UnpackService.UnpackAsync(Request("7z"), zstdPack, zstdTarget));
+            check(zstdError is null
+                && File.ReadAllText(Path.Combine(zstdTarget, "hello.txt")).StartsWith("hello zstd 7z fixture", StringComparison.Ordinal)
+                && File.ReadAllBytes(Path.Combine(zstdTarget, "sub", "data.bin")).Length == 1024,
+                $"7z native: zstd-coded 7z archive (7z-ZS codec) extracts correctly ({zstdError?.Message})");
+        }
+        else Console.WriteLine("SKIP  7z zstd codec check requires the Windows native engine");
+
         foreach (var architecture in new[] { Architecture.X86, Architecture.X64, Architecture.Arm64 })
             check(File.Exists(SevenZipUnpacker.GetLibraryPath(AppContext.BaseDirectory, architecture)),
                 $"7z package: private native asset is present for {architecture}");
@@ -291,4 +306,15 @@ internal static class UnpackProgressChecks
         "cMSlmgKmE1NlNBshEWu1hAVThAJekj1JxdIOHQDi32qYi5tajE4cndqbjx/fsd9gk57Cjswf3RK2/Vvldj6NeJ0zyRJb/gzmy3YG" +
         "Qf8te+OCFRyFRjLtkQa6XVP5XEpvJHf/68MtL1+1bIKFliT7z2AM8NecM+By0bILTBZI2+PKhE3l6ogsN8yvSRONIxbX8pD45Tus" +
         "6yRQI0pKYmMXBoYwAQmAwAAHCwEAAiQG8QcBElMPRt3ZR226KybI8fHuPL6HzCMDAQEFXQAQAAABAAyAsoD+CgHwpOZzAAA=";
+
+    // ZSTD-in-7z 夹具（hello.txt + sub/data.bin，7-Zip ZS 26.02 用 -m0=zstd 制作，505 字节）：
+    // 官方 7-Zip 的 7z 格式不支持该容器内编码器（ID 04 F7 11 01），换回官方 dll 时此用例必须红。
+    private const string ZstdFixture = "N3q8ryccAAQNVzu+tgEAAAAAAAAjAAAAAAAAAPOm0k8otS/9AAglCQB0EWhlbGxvIHpzdGQgN3ogZml4dHVyZSB4" +
+        "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8gISIjJCUmJygpKissLS4vMDEyMzQ1Njc4OTo7PD0+" +
+        "P0BBQkNERUZHSElKS0xNTk9QUVJTVFVWV1hZWltcXV5fYGFiY2RlZmdoaWprbG1ub3BxcnN0dXZ3eHl6e3x9" +
+        "fn+AgYKDhIWGh4iJiouMjY6PkJGSk5SVlpeYmZqbnJ2en6ChoqOkpaanqKmqq6ytrq+wsbKztLW2t7i5uru8" +
+        "vb6/wMHCw8TFxsfIycrLzM3Oz9DR0tPU1dbX2Nna29zd3t/g4eLj5OXm5+jp6uvs7e7v8PHy8/T19vf4+fr7" +
+        "/P3+/wIAAP0GVjXDq6AJAACBMweuD9U40RhXJNP+s4V69mpDGLoqScCGRMWTg7GON6EzNhD3+1eCgF0ViSFC" +
+        "+K/9lu+f7hsQGFNXj2i78s31ngKcCy0y3FP3ISEtFkuu/dAKK5vxvLIXZqaMnvHyngtOoAPGiujSL1QKkpju" +
+        "VZ40QAUK6XRCGMwkflFke9N06raLx7xQGQ8XBoEtAQmAiQAHCwEAASMDAQEFXQAQAAAMgKoKAVfi//4AAA==";
 }
