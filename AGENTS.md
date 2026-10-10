@@ -52,6 +52,8 @@
 ### User Preferences
 <!-- 用户偏好与约定。例：- 提交信息一律使用中文 -->
 - **GitHub issue 不自动回评论、不自动关单**（2026-10-04 用户明确要求，issue #1 被回评后被 reopen）：不在 issue/PR 下发评论；commit message 不用 fixes/close 等自动关单关键词；是否解决由用户验证后自行决定
+- **UI 元素位置必须固定，不应随状态四处移动**（2026-10-09「完成后关机」用户拍板）：变化的文本用固定宽度列+右对齐，别推动旁边控件；勾选框类开关文本恒定（勾选=生效、未勾选=不生效），不做"勾选后变取消按钮"这类形态切换
+- 「完成后关机」交互约定（2026-10-09 用户拍板）：勾选=确定关机、未勾选=不关机；**无活动任务时锁定勾选**（没有任务不应进行关机动作，也能防重启残留意外触发）；有失败任务仍关机，但倒计时提示必须带失败数；倒计时 10s 且可中途取消；开关会话级不持久化（重启自动复位）
 
 ### Project Facts
 <!-- 架构、依赖、外部系统、为什么这么做。例：- 编译目标 net8.0-windows，原因：宿主 PotatoVN 限定 -->
@@ -85,6 +87,7 @@
 - **宿主稳定版 v1.10.2 Bangumi 登录 NRE（宿主 bug，dev 已修，2026-10-08 定位）**：BgmOAuthService.BaseUriAsync 读顶层 `_config["PotatoVNOfficialServer"]`，而 appsettings.json 把键嵌在 `Urls:` 下 → GetServerInfoAsync 成功但 BangumiOauth2Enable!=true（自建服务器或官方未开开关）时 fallback `new Uri(null)` 抛 ArgumentNullException('uriString')；dev 5ca2589a 已改为 "Urls:PotatoVNOfficialServer"，随下一宿主版本带出。网络失败不触发此 NRE（GetServerInfoAsync 无 catch，直接抛网络异常）。potato-vn://oauth-bgm 激活宿主与插件各自独立收到（AppInstance.Activated 多播），插件拒收不阻断宿主处理；插件侧已修：非 install host 只留 Informational 日志，不再弹错误条/写 ERR
 - **宿主按名刮削只查用户默认信息源**（2026-10-08"甜蜜女友2 刮削失败"定位）：AddVirtualGame(title)→AddGameAsync→ParseGalInfoOnlyAsync 只用 KeyValues.RssType 默认源（通常 Bangumi）；默认源网络不通或查无结果时，即使其它源能查到也统一报"没有从信息源中找到这个游戏的信息"，真实解析异常被 _infoService.Log（DevelopmentMode 过滤）吞掉。此时插件 EnsurePlaceholder 容错返回 null → 稀疏 meta（名+推送 ID）入库 → 用户手动换源刮削补齐是预期恢复路径；稳定版无按 ID 直接建游戏的 API（AddVirtualGameAsync(Galgame) 是 dev 限定），无法绕开按名搜索
 - **自建 PotatoVN 服务器与 Bangumi OAuth2（2026-10-08 全链路核实）**：服务端在同一仓库 GalgameManager.Server，开关=docker-compose 环境变量 `AppSettings:Bangumi:{OAuth2Enable,AppId,AppSecret,RedirectUri}`（appsettings.json 默认 RedirectUri=potato-vn://oauth-bgm）。但原版客户端 BgmOAuthConfig 写死官方 bgm AppId（bgm26036422a855d5849），authorize 与 code 都绑官方应用 → 自建服务器配自己的 bgm 应用在换 token 时必被 bgm.tv 拒（code 与 client_id 不匹配），除非拿到官方 AppSecret。自建用户可行路径=账户页 bangumi 登录弹窗选"手动 access token"（AuthWithAccessToken，bgm 个人令牌，无 refresh token → NextRefresh=2077 不再走服务器 refresh）；或等宿主带 5ca2589a 修复的新版——修复后自建服务器 BangumiOauth2Enable=false 会自动 fallback 到官方 api.potatovn.net 完成 bangumi oauth/refresh。各 Phraser 在条目已有本源 ID 时按 ID 直取不搜名（VndbPhraser.Parse 实证），所以"有精确 ID 的条目手动刮削必精确"
+- **「完成后关机」实现（2026-10-09，dd60dd4）**：DownloadManager.ShutdownArmed（SetShutdownArmed 无活动任务时拒绝挂起）+ BumpActiveCount 里活动数归零即一次性触发 ShutdownCountdownRequested（失败数=Tasks 里 Failed 计数与挂起时 baseline 的差值，Tasks 只增不减所以差值准确；终态路径全覆盖=每个任务收尾都走 BumpActiveCount）；Plugin_Ui 10s DispatcherTimer 倒计时（静态状态，面板 500ms 轮询读 ShutdownCountdownRemaining）→ `shutdown.exe /s /t 0`（Process.Start 无需特权，不要走 ExitWindowsEx 提权路线）；倒计时期间新推送到达→取消倒计时并重新挂起（ActiveTaskCountChanged 里判定），OnUninstallAsync 必须 CancelShutdownCountdown；UI=ContentDialog.Title 塞自定义 Grid（标题+固定 180px 倒计时列+CheckBox），Title 是 object 类型可以直接放 UIElement
 
 ### Feedback / Lessons
 <!-- 用户纠正过的做法 + 原因。例：- 不要 mock 数据库测试，原因：上次 mock 通过但生产迁移失败 -->
@@ -124,6 +127,7 @@
 - **issue #1 修法（方案 C，2026-10-04）**：SSRF 守卫分两层——请求层 `EnsureTargetAllowedAsync` 查 RequestUri.Host（字面/内网后缀/DNS 解析，每跳重定向都查；自动重定向已关，手动跟 ≤5 跳），直连 ConnectCallback 保留"解析+校验+钉住"防 DNS 重绑定；代理端点是用户配置不是目标，永不拦它。代理建连失败（MSIX 拦回环 = SocketException AccessDenied 10013，秒 fail-fast）自动降级直连（实例级 `_proxyBroken`，新任务自动重试代理）；系统代理每任务经 `WebRequest.GetSystemWebProxy()` 快照——`HttpClient.DefaultProxy` 进程级缓存是"改代理要重启宿主"的根因
 - **文件夹选择不能用 Windows.Storage.Pickers.***：MSIX 打包宿主里静默不弹窗（宿主 PvnFsPicker 手搓 COM 即因此）；Microsoft.Windows.Storage.Pickers 需宿主 WinAppSDK≥1.8 运行时（稳定版不保证）。插件用 `Helper/FolderPickerDialog.cs`（COM IFileOpenDialog+FOS_PICKFOLDERS，vtable 必须全序声明），owner HWND = `WinRT.Interop.WindowNative.GetWindowHandle(HostApi.GetMainWindow())`；UI 线程（STA）同步调即可（模态框自泵消息）
 - **FontIcon 字形等 PUA 字符别直接写进源码**：file_editor 会把 `\uE8B7` 这类转义落成原始字符、二次编辑匹配困难；写 `((char)0xE8B7).ToString()` 纯 ASCII 形式（2026-10-04 实证）
+- **C# 关系模式 `is > TimeSpan.Zero` 编译不过**（CS9135，2026-10-09 build 实证）：关系模式要求常量，而 TimeSpan.Zero/DateTime.Now 这类是 static 成员不是 const——改 `?? TimeSpan.Zero` 兜底后直接比较
 
 ### References
 <!-- 外部资源指针。例：- 报错日志查 Grafana: grafana.internal/d/plugin-runtime -->
