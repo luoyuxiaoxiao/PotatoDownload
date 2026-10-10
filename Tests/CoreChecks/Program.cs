@@ -699,6 +699,39 @@ internal static class Program
         Check(Directory.GetDirectories(downloadDir).Length == dirsBefore,
             "manager: auto-unpack off creates no game directory");
         Plugin.AutoUnpack = true;
+
+        // 8. 完成后关机：没有活动任务时勾选无效（锁定语义：没有任务就不应进行关机动作）
+        manager2.SetShutdownArmed(true);
+        Check(!manager2.ShutdownArmed, "manager: arming shutdown without an active task is rejected");
+
+        // 9. 挂起后最后一个活动任务结束（含用户取消）→ 触发一次关机倒计时请求并消费挂起
+        int? shutdownFailed = null;
+        manager2.ShutdownCountdownRequested += failed => shutdownFailed = failed;
+        var run8 = manager2.EnqueueAsync(R("slow"));
+        var t8 = await WaitUntilAsync(
+            () => manager2.Tasks.Count > 1 && manager2.Tasks[1].IsActive ? manager2.Tasks[1] : null,
+            "armed task to become active");
+        manager2.SetShutdownArmed(true);
+        Check(manager2.ShutdownArmed, "manager: shutdown arms while a task is active");
+        manager2.CancelTask(t8);
+        await run8;
+        Check(t8.Stage == DownloadTaskStage.Cancelled && shutdownFailed == 0 && !manager2.ShutdownArmed,
+            "manager: armed shutdown fires exactly once when the last active task ends");
+
+        // 10. 挂起期间新增的失败任务计入提示（校验失败 → Failed）
+        var run9 = manager2.EnqueueAsync(new InstallRequest
+        {
+            V = 1, Provider = "shionlib", ResourceId = "bad", Url = server.Prefix + "ok", FileName = "g.zip",
+            ArchiveFormat = "zip", Size = (ulong)payload.Length, BgmId = "13", Title = "CLANNAD bad",
+            ChecksumAlgo = "sha256", Checksum = new string('0', 64),
+        });
+        await WaitUntilAsync(
+            () => manager2.Tasks.Count > 2 && manager2.Tasks[2].IsActive ? manager2.Tasks[2] : null,
+            "failing task to become active");
+        manager2.SetShutdownArmed(true);
+        await run9;
+        Check(manager2.Tasks[2].Stage == DownloadTaskStage.Failed && shutdownFailed == 1,
+            "manager: shutdown request reports failures that occurred while armed");
     }
 
     // ---------------------------------------------------------------- 中断任务还原

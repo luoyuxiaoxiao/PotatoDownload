@@ -27,7 +27,17 @@ public sealed class DownloadProgressDialog : UserControl
     private readonly FrameworkElement _activeHeader;
     private readonly FrameworkElement _historyHeader;
     private readonly TextBlock _emptyText;
+    private readonly CheckBox _shutdownCheck;
+    private readonly TextBlock _shutdownCountdownText;
+    private bool _syncingShutdown;
     private bool _historyExpanded;
+
+    /// <summary>
+    /// 对话框标题栏（ContentDialog.Title）：左侧标题，右侧固定「关机」勾选框，倒计时文本在固定宽度的
+    /// 中间列右对齐——文本长度变化不会推动勾选框，三者位置恒定。勾选=全部任务完成后关机，取消勾选=不关机
+    /// （倒计时进行中取消勾选即取消关机）；没有活动任务时勾选框锁定。
+    /// </summary>
+    internal FrameworkElement DialogHeader { get; }
 
     /// <summary>
     /// 进度轮询计时器：PropertyChanged→InvokeOnMainThread 链路在宿主环境被实证不可靠（面板冻结、
@@ -51,6 +61,49 @@ public sealed class DownloadProgressDialog : UserControl
         };
         if (PluginTheme.GetBrush("TextFillColorSecondaryBrush") is { } secondary)
             _emptyText.Foreground = secondary;
+
+        _shutdownCountdownText = new TextBlock
+        {
+            FontSize = 12,
+            Opacity = 0.75,
+            TextAlignment = TextAlignment.Right,
+            VerticalAlignment = VerticalAlignment.Center,
+        };
+        _shutdownCheck = new CheckBox
+        {
+            Content = "关机",
+            FontSize = 12,
+            VerticalAlignment = VerticalAlignment.Center,
+        };
+        _shutdownCheck.Checked += (_, _) =>
+        {
+            if (_syncingShutdown) return;
+            Plugin.DownloadManager.SetShutdownArmed(true);
+            SyncShutdownUi();
+        };
+        _shutdownCheck.Unchecked += (_, _) =>
+        {
+            if (_syncingShutdown) return;
+            Plugin.DownloadManager.SetShutdownArmed(false);
+            Plugin.CancelShutdownCountdown();
+            SyncShutdownUi();
+        };
+        var header = new Grid { HorizontalAlignment = HorizontalAlignment.Stretch };
+        header.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+        header.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(180) });
+        header.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+        header.Children.Add(new TextBlock
+        {
+            Text = "下载",
+            FontSize = 20,
+            VerticalAlignment = VerticalAlignment.Center,
+        });
+        Grid.SetColumn(_shutdownCountdownText, 1);
+        header.Children.Add(_shutdownCountdownText);
+        Grid.SetColumn(_shutdownCheck, 2);
+        header.Children.Add(_shutdownCheck);
+        DialogHeader = header;
+        SyncShutdownUi();
 
         var root = new StackPanel { Spacing = 10 };
         root.Children.Add(_activeHeader);
@@ -126,6 +179,7 @@ public sealed class DownloadProgressDialog : UserControl
     /// <summary>每 500ms 在 UI 线程上直接读任务模型刷新行；列出的任务数变化时顺手重建（移出已完成行）。</summary>
     private void OnRefreshTick(object? sender, object e)
     {
+        SyncShutdownUi();
         var listed = 0;
         foreach (var task in Plugin.DownloadManager.Tasks)
             if (task.IsListed) listed++;
@@ -136,6 +190,31 @@ public sealed class DownloadProgressDialog : UserControl
         }
         foreach (var child in _activePanel.Children)
             if (child is TaskRow row) row.Refresh();
+    }
+
+    /// <summary>同步「关机」勾选框与倒计时显示（勾选事件与 500ms 轮询都走这里）。</summary>
+    private void SyncShutdownUi()
+    {
+        var remaining = Plugin.ShutdownCountdownRemaining ?? TimeSpan.Zero;
+        var countingDown = remaining > TimeSpan.Zero;
+        var hasActive = false;
+        foreach (var task in Plugin.DownloadManager.Tasks)
+            if (task.IsActive) { hasActive = true; break; }
+        _syncingShutdown = true;
+        _shutdownCheck.IsChecked = countingDown || Plugin.DownloadManager.ShutdownArmed;
+        _syncingShutdown = false;
+        // 没有活动任务且不在倒计时：锁定勾选框——没有任务就不应进行关机动作
+        _shutdownCheck.IsEnabled = hasActive || countingDown;
+        if (countingDown)
+        {
+            var failed = Plugin.ShutdownCountdownFailedCount;
+            _shutdownCountdownText.Text = (failed > 0 ? $"{failed} 个任务失败，" : string.Empty)
+                + $"{(int)Math.Ceiling(remaining.TotalSeconds)} 秒后关机";
+        }
+        else
+        {
+            _shutdownCountdownText.Text = string.Empty;
+        }
     }
 
     private void Rebuild()

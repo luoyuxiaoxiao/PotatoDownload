@@ -134,6 +134,41 @@ public class DownloadManager
     /// <summary>活动任务数变化时触发（用于侧边栏状态刷新），参数为当前活动任务数。</summary>
     public event Action<int>? ActiveTaskCountChanged;
 
+    /// <summary>「完成后关机」挂起期间新增的失败任务数基准（Tasks 只增不减，差值即新增）。</summary>
+    private int _shutdownFailedBaseline;
+
+    /// <summary>
+    /// 「完成后关机」是否已挂起：会话级状态（不持久化，重启自动复位）。
+    /// 挂起后等全部活动任务结束（成功/失败/取消都算），触发一次 <see cref="ShutdownCountdownRequested"/>。
+    /// </summary>
+    public bool ShutdownArmed { get; private set; }
+
+    /// <summary>挂起的关机请求生效（全部活动任务结束）时触发，参数为挂起期间新增的失败任务数。在主线程触发。</summary>
+    public event Action<int>? ShutdownCountdownRequested;
+
+    /// <summary>
+    /// 勾选/取消「完成后关机」。没有活动任务时勾选无效（没有任务就不应进行关机动作，UI 层同步禁用勾选框）。
+    /// 只在主线程调用（遍历 Tasks）。
+    /// </summary>
+    public void SetShutdownArmed(bool armed)
+    {
+        if (!armed)
+        {
+            ShutdownArmed = false;
+            return;
+        }
+        var hasActive = false;
+        var failed = 0;
+        foreach (var task in Tasks)
+        {
+            if (task.IsActive) hasActive = true;
+            if (task.Stage == DownloadTaskStage.Failed) failed++;
+        }
+        if (!hasActive) return;
+        _shutdownFailedBaseline = failed;
+        ShutdownArmed = true;
+    }
+
     public DownloadManager(IPotatoVnApi hostApi)
     {
         _hostApi = hostApi;
@@ -329,8 +364,18 @@ public class DownloadManager
     private void BumpActiveCount()
     {
         var count = 0;
+        var failed = 0;
         foreach (var task in Tasks)
+        {
             if (task.IsActive) count++;
+            if (task.Stage == DownloadTaskStage.Failed) failed++;
+        }
+        // 每个任务到达终态后都会走到这里：挂起的「完成后关机」在活动任务归零时一次性触发并消费
+        if (ShutdownArmed && count == 0)
+        {
+            ShutdownArmed = false;
+            ShutdownCountdownRequested?.Invoke(failed - _shutdownFailedBaseline);
+        }
         if (count == _lastActiveCount) return;
         _lastActiveCount = count;
         ActiveTaskCountChanged?.Invoke(count);

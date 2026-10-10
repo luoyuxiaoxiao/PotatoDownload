@@ -61,7 +61,17 @@ namespace PotatoVN.App.PluginBase
             InitUi();
 
             DownloadManager = new DownloadManager(_hostApi);
-            DownloadManager.ActiveTaskCountChanged += count => UpdateDownloadSidebarState(count);
+            DownloadManager.ActiveTaskCountChanged += count =>
+            {
+                UpdateDownloadSidebarState(count);
+                // 关机倒计时期间有新任务开始：中止倒计时并重新挂起，等新批次全部结束再触发
+                if (count > 0 && ShutdownCountdownRemaining is not null)
+                {
+                    CancelShutdownCountdown();
+                    DownloadManager.SetShutdownArmed(true);
+                }
+            };
+            DownloadManager.ShutdownCountdownRequested += BeginShutdownCountdown;
             try
             {
                 // 还原上次被主程序退出打断的下载（在推送服务启动前，保证去重能看到这些任务）
@@ -79,6 +89,7 @@ namespace PotatoVN.App.PluginBase
         public async Task OnUninstallAsync(bool deleteData, Action<TimeSpan> extendWaitHandler, CancellationToken cts)
         {
             if (cts.IsCancellationRequested) return;
+            CancelShutdownCountdown(); // 卸载/停用时挂着的关机倒计时必须作废，避免插件没了机器还被关
             DownloadManager?.Shutdown(); // 先停下载：后台任务持有程序集与文件句柄，不停会导致 DLL 删除失败
             if (_pushService is not null) await _pushService.StopAsync();
             if (DownloadManager is not null) await DownloadManager.ShutdownAsync(cts);
