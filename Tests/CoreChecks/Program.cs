@@ -13,6 +13,7 @@ using System.Threading.Tasks;
 using PotatoVN.App.PluginBase;
 using PotatoVN.App.PluginBase.Models;
 using PotatoVN.App.PluginBase.Services;
+using PotatoVN.App.PluginBase.Helper;
 
 namespace CoreChecks;
 
@@ -33,6 +34,7 @@ internal static class Program
         {
             CheckValidation();
             CheckPluginDataRoundTrip();
+            CheckFolderPicker();
             ProgressDisplayChecks.Run(Check);
             await CheckDownloadsAsync();
             await DownloadTuningChecks.RunAsync(Root, Check);
@@ -145,6 +147,47 @@ internal static class Program
             && back.History[0].Size == 123456789
             && back.DownloadPath == @"D:\Games" && back.AutoDownload && !back.AutoUnpack,
             "persist: PluginData json round-trip keeps history and settings");
+    }
+
+    // ---------------------------------------------------------------- FolderPickerDialog（Windows）
+
+    /// <summary>
+    /// 文件夹选择器回归（2026-11 issue）：
+    /// 1) SHCreateItemFromParsingName 旧声明漏 out 参数（DllImport 默认 PreserveSig=true），
+    ///    原生四参数函数从垃圾寄存器读 ppv 写入 → 0xC0000005 进程崩溃；错误路径必须干净返回。
+    /// 2) 部分系统 GetDisplayName(FILESYSPATH) 退化为只返回文件夹名（Windows Server 2022 容器
+    ///    raw vtable 直调实证），ResolveFileSystemPath 必须回退 DESKTOPABSOLUTEPARSING 给出绝对路径。
+    /// </summary>
+    private static void CheckFolderPicker()
+    {
+        if (!OperatingSystem.IsWindows())
+        {
+            Console.WriteLine("SKIP  folder picker checks (Windows only)");
+            return;
+        }
+        var dir = Path.Combine(Root, "picker probe");
+        Directory.CreateDirectory(dir);
+        var fullPath = Path.GetFullPath(dir);
+
+        var hrBad = FolderPickerDialog.SHCreateItemFromParsingName(fullPath + "-nonexistent", nint.Zero,
+            typeof(FolderPickerDialog.IShellItem).GUID, out var bad);
+        Check(hrBad != 0 && bad is null, $"picker: nonexistent path fails cleanly (hr=0x{hrBad:X8})");
+
+        var hr = FolderPickerDialog.SHCreateItemFromParsingName(fullPath, nint.Zero,
+            typeof(FolderPickerDialog.IShellItem).GUID, out var item);
+        Check(hr == 0 && item is not null, $"picker: SHCreateItemFromParsingName returns item (hr=0x{hr:X8})");
+        if (item is null) return;
+        try
+        {
+            var resolved = FolderPickerDialog.ResolveFileSystemPath(item);
+            Check(Path.IsPathFullyQualified(resolved)
+                  && string.Equals(Path.GetFullPath(resolved), fullPath, StringComparison.OrdinalIgnoreCase),
+                $"picker: resolves to absolute path '{resolved}'");
+        }
+        catch (Exception e)
+        {
+            Check(false, $"picker: resolve threw {e.GetType().Name}: {e.Message}");
+        }
     }
 
     // ---------------------------------------------------------------- DownloadService
