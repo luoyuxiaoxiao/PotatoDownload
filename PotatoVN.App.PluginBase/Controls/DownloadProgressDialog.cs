@@ -75,6 +75,9 @@ public sealed class DownloadProgressDialog : UserControl
             Content = "关机",
             FontSize = 12,
             VerticalAlignment = VerticalAlignment.Center,
+            // 汉字在 20px 行框内偏上（行框含西文降部空间），几何居中会比重心的勾选框低约 2px；
+            // 负上边距把勾选框上移 2px 让两者的视觉中心轴重合（总边距为 0，不改变行高）
+            Margin = new Thickness(0, -2, 0, 2),
         };
         _shutdownCheck.Checked += (_, _) =>
         {
