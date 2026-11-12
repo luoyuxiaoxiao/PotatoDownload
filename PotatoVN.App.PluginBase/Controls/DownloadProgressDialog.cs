@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.Collections.Specialized;
 using System.Diagnostics;
+using System.IO;
 using Microsoft.UI.Text;
 using Microsoft.UI.Xaml;
 using Microsoft.UI.Xaml.Controls;
@@ -88,7 +89,7 @@ public sealed class DownloadProgressDialog : UserControl
             Plugin.CancelShutdownCountdown();
             SyncShutdownUi();
         };
-        var header = new Grid { HorizontalAlignment = HorizontalAlignment.Stretch };
+        var header = new Grid { HorizontalAlignment = HorizontalAlignment.Stretch, MinWidth = 480 };
         header.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
         header.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(180) });
         header.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
@@ -104,6 +105,10 @@ public sealed class DownloadProgressDialog : UserControl
         header.Children.Add(_shutdownCheck);
         DialogHeader = header;
         SyncShutdownUi();
+
+        // ContentDialog 的 Title 容器不会拉伸自定义内容（标题栏只剩内容宽度，勾选框挤在中间），
+        // 让标题栏宽度跟随对话框内容宽度，「关机」勾选框才能真正贴到右端。
+        SizeChanged += (_, _) => DialogHeader.Width = ActualWidth;
 
         var root = new StackPanel { Spacing = 10 };
         root.Children.Add(_activeHeader);
@@ -347,12 +352,52 @@ public sealed class DownloadProgressDialog : UserControl
             Text = record.FinishedAt.ToLocalTime().ToString("MM-dd HH:mm"),
             FontSize = 12,
             Opacity = 0.55,
-            VerticalAlignment = VerticalAlignment.Top,
+            VerticalAlignment = VerticalAlignment.Center,
         };
-        Grid.SetColumn(timeText, 2);
-        grid.Children.Add(timeText);
+        // 时间文本始终顶在最右端；完成且有目标位置的记录在时间左侧多一个文件夹按钮，位置恒定
+        var rightStack = new StackPanel
+        {
+            Orientation = Orientation.Horizontal,
+            Spacing = 6,
+            VerticalAlignment = VerticalAlignment.Center,
+        };
+        if (ok && !string.IsNullOrWhiteSpace(record.TargetPath))
+        {
+            var openButton = new Button
+            {
+                Content = new SymbolIcon(Symbol.Folder),
+                Width = 28,
+                Height = 28,
+                Padding = new Thickness(0),
+            };
+            ToolTipService.SetToolTip(openButton, "打开所在位置");
+            var targetPath = record.TargetPath;
+            openButton.Click += (_, _) => OpenTargetLocation(targetPath);
+            rightStack.Children.Add(openButton);
+        }
+        rightStack.Children.Add(timeText);
+        Grid.SetColumn(rightStack, 2);
+        grid.Children.Add(rightStack);
 
         return Card(grid);
+    }
+
+    /// <summary>打开历史记录的目标位置：目录直接打开，压缩包在资源管理器中选中；目标已不存在时提示而不是报错。</summary>
+    private static void OpenTargetLocation(string path)
+    {
+        try
+        {
+            if (Directory.Exists(path))
+                Process.Start(new ProcessStartInfo("explorer.exe", $"\"{path}\"") { UseShellExecute = true });
+            else if (File.Exists(path))
+                Process.Start(new ProcessStartInfo("explorer.exe", $"/select,\"{path}\"") { UseShellExecute = true });
+            else
+                Plugin.HostApi.Info(InfoBarSeverity.Warning, "PotatoDownload", "目标位置已不存在（可能已被移动或删除）");
+        }
+        catch (Exception e)
+        {
+            Plugin.HostApi.Event(InfoBarSeverity.Error, "PotatoDownload", e, "无法打开目标位置");
+        }
     }
 
     /// <summary>活动任务行：按当前阶段展示真实字节进度；速度使用三秒滑窗，未知总量时使用不定进度条。</summary>

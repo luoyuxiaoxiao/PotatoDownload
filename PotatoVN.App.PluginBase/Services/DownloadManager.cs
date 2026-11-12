@@ -48,6 +48,9 @@ public class DownloadTask
     internal string? PackPath { get; set; }
     internal string? GamePath { get; set; }
 
+    /// <summary>完成后的目标位置：解压入库模式=游戏目录；仅下载模式=保留下来的压缩包路径。随历史记录持久化。</summary>
+    internal string? CompletedTargetPath { get; set; }
+
     public CancelRequestKind CancelRequest { get; private set; } = CancelRequestKind.None;
 
     private volatile DownloadTaskStage _stage = DownloadTaskStage.Pending;
@@ -429,6 +432,7 @@ public class DownloadManager
                 task.PackPath = null; // 先摘清再挪：此后压缩包是用户的文件，取消清理逻辑绝不再碰它
                 File.Move(packPath, keepPath);
                 TryDeleteFile(RequestSidecarPath(packPath));
+                task.CompletedTargetPath = keepPath;
                 task.Message = "已下载（按设置跳过解压与入库）";
                 task.Stage = DownloadTaskStage.Completed;
                 RecordHistory(task, DownloadRecord.OutcomeCompleted);
@@ -463,6 +467,7 @@ public class DownloadManager
                 if (wroteMeta) LibraryService.CleanupLocalMeta(gamePath);
             }
             UnpackService.MarkComplete(gamePath);
+            task.CompletedTargetPath = gamePath;
 
             // 6. 清理压缩包
             File.Delete(packPath);
@@ -636,6 +641,7 @@ public class DownloadManager
                     Outcome = outcome,
                     Message = task.Message,
                     FinishedAt = DateTimeOffset.Now,
+                    TargetPath = task.CompletedTargetPath,
                 });
                 while (history.Count > MaxHistoryCount)
                     history.RemoveAt(history.Count - 1);

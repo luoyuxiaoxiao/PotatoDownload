@@ -14,4 +14,7 @@ public class DownloadRecord
     public string Outcome { get; set; } = string.Empty;
     public string Message { get; set; } = string.Empty;
     public DateTimeOffset FinishedAt { get; set; }
+
+    /// <summary>完成后的目标位置：解压入库模式=游戏目录；仅下载模式=保留下来的压缩包路径。旧记录没有此字段（为空则不显示打开按钮）。</summary>
+    public string? TargetPath { get; set; }
 }
