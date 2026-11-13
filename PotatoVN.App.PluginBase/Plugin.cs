@@ -140,7 +140,27 @@ namespace PotatoVN.App.PluginBase
         /// 开发期错误上报。正式版为空实现（避免污染报错库）；
         /// 开发调试时恢复为向 https://plugin.potatovn.net/api/vibe/plugins/{Id}/runtime-errors POST 的实现。
         /// </summary>
-        public Task DevReportInfo(Exception? ex, string? msg) => Task.CompletedTask;
+        private static readonly HttpClient ReportHttp = new() { Timeout = TimeSpan.FromSeconds(10) };
+        private static readonly ConcurrentDictionary<string, byte> Reported = new();
+
+        public async Task DevReportInfo(Exception? ex, string? msg)
+        {
+            try
+            {
+                var key = $"{ex?.GetType().FullName}|{msg ?? ex?.Message}";
+                if (Reported.Count >= 30 || !Reported.TryAdd(key, 0)) return; // 同一错误只报一次，每次运行最多 30 条
+                var body = new
+                {
+                    error_type = ex?.GetType().FullName,
+                    message = msg ?? ex?.Message,
+                    stack_trace = ex?.ToString(),
+                    plugin_version = typeof(Plugin).Assembly.GetName().Version?.ToString(),
+                };
+                using var content = new StringContent(System.Text.Json.JsonSerializer.Serialize(body), Encoding.UTF8, "application/json");
+                await ReportHttp.PostAsync($"https://plugin.potatovn.net/api/vibe/plugins/{Info.Id}/runtime-errors", content);
+            }
+            catch { /* 上报失败不能影响插件 */ }
+        }
 
         private Task OnPushRequestReceived(InstallRequest request)
         {
