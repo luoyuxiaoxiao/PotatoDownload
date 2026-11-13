@@ -1,5 +1,7 @@
 using System;
 using PotatoVN.App.PluginBase.Helper;
+using PotatoVN.App.PluginBase.Models;
+using PotatoVN.App.PluginBase.Services;
 
 namespace CoreChecks;
 
@@ -52,5 +54,19 @@ internal static class ProgressDisplayChecks
         speed.Reset();
         speed.Update(100 * mib, TimeSpan.FromSeconds(8));
         check(speed.BytesPerSecond is null, "speed: a new pipeline stage cannot inherit the previous stage rate");
+
+        // 侧边栏进度条读的阶段进度：只有下载和已知总量的解压给出数值，其余阶段必须是 null（不定进度）。
+        var task = new DownloadTask(new InstallRequest { Size = 1000 });
+        check(task.StagePercent is null, "stage percent: a queued task has no measurable progress");
+        task.Stage = DownloadTaskStage.Downloading;
+        task.Received = 500;
+        check(task.StagePercent == 50, "stage percent: downloading reports byte progress");
+        task.Stage = DownloadTaskStage.Verifying;
+        check(task.StagePercent is null, "stage percent: verifying does not reuse the finished download bytes");
+        task.Stage = DownloadTaskStage.Unpacking;
+        task.UnpackProgress = new UnpackProgress(10, null, 1, null, null);
+        check(task.StagePercent is null, "stage percent: unpacking with unknown total is indeterminate");
+        task.UnpackProgress = new UnpackProgress(250, 1000, 1, null, null);
+        check(task.StagePercent == 25, "stage percent: unpacking with known total reports extracted bytes");
     }
 }

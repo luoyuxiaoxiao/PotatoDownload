@@ -59,9 +59,10 @@ public partial class Plugin : IGalgamePageLeftPanel, IGalgamePageRightPanel
         _uiInit = true;
     }
 
+    private const string SidebarButtonId = "potato-download";
+
     /// <summary>
-    /// 刷新侧边栏「下载」按钮的外观：无活动任务时显示静态下载图标，
-    /// 有活动任务时切换为同步图标并显示任务数（对齐 Chrome 下载按钮的状态变化）。
+    /// 刷新侧边栏「下载」按钮：图标恒为下载图标，有活动任务时文字带任务数，并在按钮底部挂一根小进度条。
     /// 通过 Unregister+Register 替换实现（宿主 API 没有原地更新按钮的接口）。
     /// </summary>
     internal void UpdateDownloadSidebarState(int activeCount)
@@ -70,24 +71,107 @@ public partial class Plugin : IGalgamePageLeftPanel, IGalgamePageRightPanel
         {
             try
             {
-                _hostApi.UnregisterSidebarButton("potato-download");
+                _hostApi.UnregisterSidebarButton(SidebarButtonId);
                 _hostApi.RegisterSidebarButton(new SidebarButtonInfo
                 {
-                    Id = "potato-download",
+                    Id = SidebarButtonId,
                     Text = activeCount > 0 ? $"下载中 ({activeCount})" : "下载",
                     Placement = SidebarButtonPlacement.Menu,
-                    FluentGlyph = activeCount > 0 ? "&#xE895;" : "&#xE896;",
+                    FluentGlyph = "&#xE896;",
                 }, () =>
                 {
                     ShowDownloadDialog();
                     return Task.CompletedTask;
                 });
+                if (activeCount > 0)
+                {
+                    if (_sidebarProgressTimer is null)
+                    {
+                        _sidebarProgressTimer = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(500) };
+                        _sidebarProgressTimer.Tick += (_, _) => SyncSidebarProgress();
+                    }
+                    _sidebarProgressTimer.Start();
+                    SyncSidebarProgress();
+                }
+                else
+                {
+                    // 归零时上面的重新注册已让宿主重建按钮，旧进度条随旧按钮一起消失
+                    _sidebarProgressTimer?.Stop();
+                }
             }
             catch (System.Exception e)
             {
                 _ = DevReportInfo(e, "UpdateDownloadSidebarState failed");
             }
         });
+    }
+
+    // ===== 侧边栏按钮进度条 =====
+    // 宿主的 SidebarButtonInfo 只收字形字符串（稳定版 v1.10.2 与 dev 一致），没有自定义图标/进度的入口。
+    // 宿主把插件按钮渲染成 NavigationViewItem { Tag = "plugin:<插件Id>:<按钮Id>", Content = Grid(60x65) { FontIcon, TextBlock } }
+    // （ShellPage.AddPluginButton），这里按 Tag 找到自己的那一格，往 Grid 里补一根小进度条。
+    // 宿主每次 ButtonsChanged（任何插件注册按钮、用户改显示设置）都会重建全部插件按钮，所以用计时器
+    // 「没有就补、有就更新」；找不到（按钮被用户隐藏、宿主改了结构）就什么都不做，按钮本身不受影响。
+    private DispatcherTimer? _sidebarProgressTimer;
+
+    private void SyncSidebarProgress()
+    {
+        try
+        {
+            // 串行队列：正在跑的任务给出进度；只有排队/校验/入库这类无总量阶段时显示不定进度
+            var active = false;
+            double? percent = null;
+            foreach (var task in DownloadManager.Tasks)
+            {
+                if (!task.IsActive) continue;
+                active = true;
+                percent = task.StagePercent;
+                if (percent is not null) break;
+            }
+            if (!active || FindSidebarButtonContent() is not { } grid) return;
+
+            ProgressBar? bar = null;
+            foreach (var child in grid.Children)
+                if (child is ProgressBar existing) { bar = existing; break; }
+            if (bar is null)
+            {
+                // 图标(y18–34)与文字(y33–49)之间没有空隙，进度条放在文字下方的留白里（y54–57）；
+                // 位置不合适只需调 Margin 的下边距
+                bar = new ProgressBar
+                {
+                    Width = 32,
+                    Height = 3,
+                    Maximum = 100,
+                    HorizontalAlignment = HorizontalAlignment.Center,
+                    VerticalAlignment = VerticalAlignment.Bottom,
+                    Margin = new Thickness(0, 0, 0, 8),
+                    IsHitTestVisible = false,
+                };
+                grid.Children.Add(bar);
+            }
+            bar.IsIndeterminate = percent is null;
+            bar.Value = percent ?? 0;
+        }
+        catch (Exception e)
+        {
+            _ = DevReportInfo(e, "SyncSidebarProgress failed");
+        }
+    }
+
+    /// <summary>宿主侧边栏里本插件按钮的内容 Grid；找不到返回 null。只读宿主的逻辑树，不改它的任何既有元素。</summary>
+    private Grid? FindSidebarButtonContent()
+    {
+        if (_hostApi.GetMainWindow()?.Content is not Page { Content: Panel root }) return null;
+        foreach (var child in root.Children)
+        {
+            if (child is not NavigationView navigation) continue;
+            foreach (var item in navigation.MenuItems)
+                if (item is NavigationViewItem { Tag: string tag, Content: Grid grid }
+                    && tag.StartsWith("plugin:", StringComparison.Ordinal)
+                    && tag.EndsWith(":" + SidebarButtonId, StringComparison.Ordinal))
+                    return grid;
+        }
+        return null;
     }
 
     private bool _downloadDialogOpen;
@@ -172,7 +256,6 @@ public partial class Plugin : IGalgamePageLeftPanel, IGalgamePageRightPanel
                     var dialog = new ContentDialog
                     {
                         XamlRoot = window.Content.XamlRoot,
-                        Title = content.DialogHeader,
                         Content = content,
                         CloseButtonText = "关闭",
                         DefaultButton = ContentDialogButton.Close,

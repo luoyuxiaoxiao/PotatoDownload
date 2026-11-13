@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.Collections.Specialized;
 using System.Diagnostics;
 using System.IO;
+using Microsoft.UI;
 using Microsoft.UI.Text;
 using Microsoft.UI.Xaml;
 using Microsoft.UI.Xaml.Controls;
@@ -28,17 +29,10 @@ public sealed class DownloadProgressDialog : UserControl
     private readonly FrameworkElement _activeHeader;
     private readonly FrameworkElement _historyHeader;
     private readonly TextBlock _emptyText;
-    private readonly CheckBox _shutdownCheck;
+    private readonly CheckBox _shutdownCheck; // 勾选=全部任务完成后关机；倒计时中取消勾选即取消关机；无活动任务时锁定
     private readonly TextBlock _shutdownCountdownText;
     private bool _syncingShutdown;
     private bool _historyExpanded;
-
-    /// <summary>
-    /// 对话框标题栏（ContentDialog.Title）：左侧标题，右侧固定「关机」勾选框，倒计时文本在固定宽度的
-    /// 中间列右对齐——文本长度变化不会推动勾选框，三者位置恒定。勾选=全部任务完成后关机，取消勾选=不关机
-    /// （倒计时进行中取消勾选即取消关机）；没有活动任务时勾选框锁定。
-    /// </summary>
-    internal FrameworkElement DialogHeader { get; }
 
     /// <summary>
     /// 进度轮询计时器：PropertyChanged→InvokeOnMainThread 链路在宿主环境被实证不可靠（面板冻结、
@@ -50,9 +44,9 @@ public sealed class DownloadProgressDialog : UserControl
     public DownloadProgressDialog()
     {
         _activeHeader = CreateHeader("进行中");
-        _activePanel = new StackPanel { Spacing = 10 };
+        _activePanel = new StackPanel { Spacing = 6 };
         _historyHeader = CreateHistoryHeader();
-        _historyPanel = new StackPanel { Spacing = 10 };
+        _historyPanel = new StackPanel { Spacing = 6 };
         _emptyText = new TextBlock
         {
             Text = "当前没有下载任务",
@@ -72,12 +66,14 @@ public sealed class DownloadProgressDialog : UserControl
         };
         _shutdownCheck = new CheckBox
         {
-            Content = "关机",
+            Content = "完成后关机",
             FontSize = 12,
+            // WinUI 的 CheckBox 默认 MinWidth=120、文字顶对齐（内边距按 14px 字号配的）：不清掉的话
+            // 勾选框右侧会留一截空白贴不到右端，12px 的文字也会比方框高出几像素
+            MinWidth = 0,
+            Padding = new Thickness(8, 0, 0, 0),
+            VerticalContentAlignment = VerticalAlignment.Center,
             VerticalAlignment = VerticalAlignment.Center,
-            // 汉字在 20px 行框内偏上（行框含西文降部空间），几何居中会比重心的勾选框低约 2px；
-            // 负上边距把勾选框上移 2px 让两者的视觉中心轴重合（总边距为 0，不改变行高）
-            Margin = new Thickness(0, -2, 0, 2),
         };
         _shutdownCheck.Checked += (_, _) =>
         {
@@ -92,7 +88,10 @@ public sealed class DownloadProgressDialog : UserControl
             Plugin.CancelShutdownCountdown();
             SyncShutdownUi();
         };
-        var header = new Grid { HorizontalAlignment = HorizontalAlignment.Stretch, MinWidth = 480 };
+        // 标题栏放在内容区顶部而不是 ContentDialog.Title：Title 容器左对齐、不拉伸自定义内容；放进内容区后
+        // 标题栏与下方卡片同宽，勾选框右缘天然与卡片右缘对齐。倒计时文本在固定宽度的中间列右对齐，
+        // 文本长度变化不会推动勾选框，三者位置恒定。
+        var header = new Grid { ColumnSpacing = 8, Margin = new Thickness(0, 0, 0, 4) };
         header.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
         header.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(180) });
         header.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
@@ -100,33 +99,32 @@ public sealed class DownloadProgressDialog : UserControl
         {
             Text = "下载",
             FontSize = 20,
+            FontWeight = FontWeights.SemiBold,
             VerticalAlignment = VerticalAlignment.Center,
         });
         Grid.SetColumn(_shutdownCountdownText, 1);
         header.Children.Add(_shutdownCountdownText);
         Grid.SetColumn(_shutdownCheck, 2);
         header.Children.Add(_shutdownCheck);
-        DialogHeader = header;
         SyncShutdownUi();
 
-        // ContentDialog 的 Title 容器不会拉伸自定义内容（标题栏只剩内容宽度，勾选框挤在中间），
-        // 让标题栏宽度跟随对话框内容宽度，「关机」勾选框才能真正贴到右端。
-        SizeChanged += (_, _) => DialogHeader.Width = ActualWidth;
+        var list = new StackPanel { Spacing = 8 };
+        list.Children.Add(_activeHeader);
+        list.Children.Add(_activePanel);
+        list.Children.Add(_historyHeader);
+        list.Children.Add(_historyPanel);
+        list.Children.Add(_emptyText);
 
-        var root = new StackPanel { Spacing = 10 };
-        root.Children.Add(_activeHeader);
-        root.Children.Add(_activePanel);
-        root.Children.Add(_historyHeader);
-        root.Children.Add(_historyPanel);
-        root.Children.Add(_emptyText);
-
-        MinWidth = 480;
-        Content = new ScrollViewer
+        var root = new StackPanel();
+        root.Children.Add(header);
+        root.Children.Add(new ScrollViewer
         {
-            Content = root,
+            Content = list,
             MaxHeight = 520,
             VerticalScrollBarVisibility = ScrollBarVisibility.Auto,
-        };
+        });
+        MinWidth = 480;
+        Content = root;
 
         Plugin.DownloadManager.Tasks.CollectionChanged += OnCollectionChanged;
         Plugin.HistoryCollection.CollectionChanged += OnCollectionChanged;
@@ -163,13 +161,13 @@ public sealed class DownloadProgressDialog : UserControl
         grid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
         grid.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
         grid.Children.Add(CreateHeader("历史记录"));
-        var clearButton = new Button
+        var clearButton = Subtle(new Button
         {
             Content = "清空历史",
             FontSize = 12,
             Padding = new Thickness(10, 2, 10, 2),
             VerticalAlignment = VerticalAlignment.Center,
-        };
+        });
         clearButton.Click += (_, _) =>
         {
             Plugin.HistoryCollection.Clear();
@@ -273,29 +271,38 @@ public sealed class DownloadProgressDialog : UserControl
         _emptyText.Visibility = activeCount + history.Count == 0 ? Visibility.Visible : Visibility.Collapsed;
     }
 
-    private static string StageText(DownloadTaskStage stage) => stage switch
-    {
-        DownloadTaskStage.Pending => "等待中",
-        DownloadTaskStage.Downloading => "下载中",
-        DownloadTaskStage.Verifying => "校验中",
-        DownloadTaskStage.Unpacking => "解压中",
-        DownloadTaskStage.Importing => "入库中",
-        DownloadTaskStage.Completed => "已完成",
-        DownloadTaskStage.Failed => "失败",
-        DownloadTaskStage.Cancelled => "已取消",
-        DownloadTaskStage.Paused => "已暂停",
-        _ => stage.ToString(),
-    };
-
-    private static TextBlock Glyph(string glyph, Brush? brush = null) => new()
+    private static TextBlock Glyph(string glyph, Brush? brush = null, double top = 2) => new()
     {
         Text = glyph,
         FontFamily = new FontFamily(GlyphFont),
         FontSize = 16,
         Foreground = brush,
         VerticalAlignment = VerticalAlignment.Top,
-        Margin = new Thickness(0, 2, 0, 0),
+        Margin = new Thickness(0, top, 0, 0),
     };
+
+    /// <summary>去掉按钮的底色与边框（悬停/按下仍有模板自带的反馈），行内按钮不抢内容的视觉重心。</summary>
+    private static Button Subtle(Button button)
+    {
+        button.Background = new SolidColorBrush(Colors.Transparent);
+        button.BorderThickness = new Thickness(0);
+        return button;
+    }
+
+    /// <summary>行内 28px 图标按钮（暂停/继续/取消/打开位置共用）。</summary>
+    private static Button IconButton(Symbol symbol, string tooltip)
+    {
+        var button = Subtle(new Button
+        {
+            Content = new SymbolIcon(symbol),
+            Width = 28,
+            Height = 28,
+            Padding = new Thickness(0),
+            VerticalAlignment = VerticalAlignment.Center,
+        });
+        ToolTipService.SetToolTip(button, tooltip);
+        return button;
+    }
 
     private static Border Card(Grid content)
     {
@@ -313,15 +320,10 @@ public sealed class DownloadProgressDialog : UserControl
         return border;
     }
 
-    private static Grid TwoColumnGrid()
-    {
-        var grid = new Grid();
-        grid.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
-        grid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
-        grid.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
-        return grid;
-    }
-
+    /// <summary>
+    /// 历史行四列：状态图标 | 标题+结果 | 完成时间 | 固定 28px 的操作列。「打开所在位置」恒在行的最右端；
+    /// 没有目标位置的记录（失败/取消/旧版本留下的记录）该列留空，时间列因此在所有行上对齐。
+    /// </summary>
     private static FrameworkElement CreateHistoryRow(DownloadRecord record)
     {
         var ok = record.Outcome == DownloadRecord.OutcomeCompleted;
@@ -329,10 +331,14 @@ public sealed class DownloadProgressDialog : UserControl
         var glyphBrush = PluginTheme.GetBrush(ok ? "SystemFillColorSuccessBrush"
             : cancelled ? "TextFillColorSecondaryBrush" : "SystemFillColorCriticalBrush");
 
-        var grid = TwoColumnGrid();
+        var grid = new Grid { ColumnSpacing = 10 };
+        grid.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+        grid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+        grid.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+        grid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(28) });
         grid.Children.Add(Glyph(ok ? "\uE73E" : cancelled ? "\uE711" : "\uEA39", glyphBrush));
 
-        var textStack = new StackPanel { Spacing = 2, Margin = new Thickness(10, 0, 10, 0) };
+        var textStack = new StackPanel { Spacing = 2 };
         Grid.SetColumn(textStack, 1);
         textStack.Children.Add(new TextBlock
         {
@@ -357,30 +363,17 @@ public sealed class DownloadProgressDialog : UserControl
             Opacity = 0.55,
             VerticalAlignment = VerticalAlignment.Center,
         };
-        // 时间文本始终顶在最右端；完成且有目标位置的记录在时间左侧多一个文件夹按钮，位置恒定
-        var rightStack = new StackPanel
-        {
-            Orientation = Orientation.Horizontal,
-            Spacing = 6,
-            VerticalAlignment = VerticalAlignment.Center,
-        };
+        Grid.SetColumn(timeText, 2);
+        grid.Children.Add(timeText);
+
         if (ok && !string.IsNullOrWhiteSpace(record.TargetPath))
         {
-            var openButton = new Button
-            {
-                Content = new SymbolIcon(Symbol.Folder),
-                Width = 28,
-                Height = 28,
-                Padding = new Thickness(0),
-            };
-            ToolTipService.SetToolTip(openButton, "打开所在位置");
+            var openButton = IconButton(Symbol.Folder, "打开所在位置");
             var targetPath = record.TargetPath;
             openButton.Click += (_, _) => OpenTargetLocation(targetPath);
-            rightStack.Children.Add(openButton);
+            Grid.SetColumn(openButton, 3);
+            grid.Children.Add(openButton);
         }
-        rightStack.Children.Add(timeText);
-        Grid.SetColumn(rightStack, 2);
-        grid.Children.Add(rightStack);
 
         return Card(grid);
     }
@@ -403,12 +396,14 @@ public sealed class DownloadProgressDialog : UserControl
         }
     }
 
-    /// <summary>活动任务行：按当前阶段展示真实字节进度；速度使用三秒滑窗，未知总量时使用不定进度条。</summary>
+    /// <summary>
+    /// 活动任务行，三行固定结构：标题+操作按钮 / 进度条 / 当前动作（左）与速度·百分比（右）。
+    /// 按当前阶段展示真实字节进度；速度使用三秒滑窗，未知总量时使用不定进度条。
+    /// </summary>
     private sealed class TaskRow : UserControl
     {
         private readonly DownloadTask _task;
         private readonly TextBlock _rightText;
-        private readonly TextBlock _speedText;
         private readonly TextBlock _messageText;
         private readonly TextBlock _detailText;
         private readonly ProgressBar _progressBar;
@@ -421,68 +416,22 @@ public sealed class DownloadProgressDialog : UserControl
 
         internal DownloadTask Task => _task;
 
-        /// <summary>Chrome 下载行风格的小图标按钮。</summary>
-        private static Button IconButton(Symbol symbol, string tooltip)
-        {
-            var button = new Button
-            {
-                Content = new SymbolIcon(symbol),
-                Width = 28,
-                Height = 28,
-                Padding = new Thickness(0),
-                VerticalAlignment = VerticalAlignment.Center,
-            };
-            ToolTipService.SetToolTip(button, tooltip);
-            return button;
-        }
-
         public TaskRow(DownloadTask task)
         {
             _task = task;
 
-            var grid = TwoColumnGrid();
-            grid.Children.Add(Glyph("\uE896"));
-
-            var centerStack = new StackPanel { Spacing = 2, Margin = new Thickness(10, 0, 10, 0) };
-            Grid.SetColumn(centerStack, 1);
-            centerStack.Children.Add(new TextBlock
+            // 暂停/继续共用同一格、取消恒在最右：按钮位置不随任务状态移动
+            var titleRow = new Grid { ColumnSpacing = 4 };
+            titleRow.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+            titleRow.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(28) });
+            titleRow.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(28) });
+            titleRow.Children.Add(new TextBlock
             {
                 Text = task.Title,
                 TextTrimming = TextTrimming.CharacterEllipsis,
                 FontWeight = FontWeights.SemiBold,
+                VerticalAlignment = VerticalAlignment.Center,
             });
-            _messageText = new TextBlock { FontSize = 12, Opacity = 0.65, TextWrapping = TextWrapping.Wrap };
-            centerStack.Children.Add(_messageText);
-            _detailText = new TextBlock
-            {
-                FontSize = 11,
-                Opacity = 0.55,
-                TextTrimming = TextTrimming.CharacterEllipsis,
-                Visibility = Visibility.Collapsed,
-            };
-            centerStack.Children.Add(_detailText);
-            _progressBar = new ProgressBar { Height = 4, Maximum = 100, Margin = new Thickness(0, 4, 0, 0) };
-            centerStack.Children.Add(_progressBar);
-            grid.Children.Add(centerStack);
-
-            var rightStack = new StackPanel
-            {
-                Spacing = 6,
-                MinWidth = 116,
-                HorizontalAlignment = HorizontalAlignment.Right,
-                VerticalAlignment = VerticalAlignment.Top,
-            };
-            _rightText = new TextBlock
-            {
-                FontSize = 12,
-                TextAlignment = TextAlignment.Right,
-            };
-            _speedText = new TextBlock
-            {
-                FontSize = 11,
-                Opacity = 0.65,
-                TextAlignment = TextAlignment.Right,
-            };
             _pauseButton = IconButton(Symbol.Pause, "暂停");
             _resumeButton = IconButton(Symbol.Play, "继续");
             _cancelButton = IconButton(Symbol.Cancel, "取消");
@@ -501,20 +450,45 @@ public sealed class DownloadProgressDialog : UserControl
                 Plugin.DownloadManager.CancelTask(_task);
                 Refresh();
             };
-            var buttonStack = new StackPanel
+            Grid.SetColumn(_pauseButton, 1);
+            Grid.SetColumn(_resumeButton, 1);
+            Grid.SetColumn(_cancelButton, 2);
+            titleRow.Children.Add(_pauseButton);
+            titleRow.Children.Add(_resumeButton);
+            titleRow.Children.Add(_cancelButton);
+
+            // 进度条始终占位（排队中为空轨道），行高不随阶段跳动
+            _progressBar = new ProgressBar { Height = 4, Maximum = 100 };
+
+            var statusRow = new Grid { ColumnSpacing = 12 };
+            statusRow.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+            statusRow.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+            _messageText = new TextBlock { FontSize = 12, Opacity = 0.65, TextTrimming = TextTrimming.CharacterEllipsis };
+            _rightText = new TextBlock { FontSize = 12, Opacity = 0.65, TextAlignment = TextAlignment.Right };
+            Grid.SetColumn(_rightText, 1);
+            statusRow.Children.Add(_messageText);
+            statusRow.Children.Add(_rightText);
+
+            _detailText = new TextBlock
             {
-                Orientation = Orientation.Horizontal,
-                Spacing = 4,
-                HorizontalAlignment = HorizontalAlignment.Right,
+                FontSize = 11,
+                Opacity = 0.55,
+                TextTrimming = TextTrimming.CharacterEllipsis,
+                Visibility = Visibility.Collapsed,
             };
-            buttonStack.Children.Add(_pauseButton);
-            buttonStack.Children.Add(_resumeButton);
-            buttonStack.Children.Add(_cancelButton);
-            rightStack.Children.Add(_rightText);
-            rightStack.Children.Add(_speedText);
-            rightStack.Children.Add(buttonStack);
-            Grid.SetColumn(rightStack, 2);
-            grid.Children.Add(rightStack);
+
+            var stack = new StackPanel { Spacing = 4 };
+            Grid.SetColumn(stack, 1);
+            stack.Children.Add(titleRow);
+            stack.Children.Add(_progressBar);
+            stack.Children.Add(statusRow);
+            stack.Children.Add(_detailText);
+
+            var grid = new Grid { ColumnSpacing = 10 };
+            grid.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+            grid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+            grid.Children.Add(Glyph("\uE896", top: 6)); // 与 28px 高的标题行垂直居中
+            grid.Children.Add(stack);
 
             Content = Card(grid);
             Refresh();
@@ -536,18 +510,17 @@ public sealed class DownloadProgressDialog : UserControl
                 _speed.Update(unpack.BytesExtracted, _clock.Elapsed);
 
             var percent = 0.0;
+            var hasPercent = false;
             var indeterminate = false;
-            var showProgress = stage != DownloadTaskStage.Pending;
             var message = _task.Message;
-            var right = StageText(stage);
             var rate = string.Empty;
             var detail = string.Empty;
             switch (stage)
             {
                 case DownloadTaskStage.Downloading:
                     percent = TransferProgressDisplay.Percent(received, _task.Total);
+                    hasPercent = true;
                     message = $"下载中 · {DownloadManager.FormatBytes(received)} / {DownloadManager.FormatBytes(_task.Total)}";
-                    right = $"{percent:F1}%";
                     rate = received >= _task.Total ? "正在收尾…" : SpeedText("等待数据…");
                     break;
                 case DownloadTaskStage.Unpacking:
@@ -557,8 +530,8 @@ public sealed class DownloadProgressDialog : UserControl
                     if (unpack.TotalBytes is > 0)
                     {
                         percent = TransferProgressDisplay.Percent(unpack.BytesExtracted, unpack.TotalBytes.Value);
+                        hasPercent = true;
                         message = $"解压中 · {DownloadManager.FormatBytes(unpack.BytesExtracted)} / {DownloadManager.FormatBytes(unpack.TotalBytes.Value)}";
-                        right = $"{percent:F1}%";
                     }
                     else
                     {
@@ -574,12 +547,17 @@ public sealed class DownloadProgressDialog : UserControl
                     indeterminate = true;
                     break;
                 case DownloadTaskStage.Paused:
+                    // 暂停保留原阶段的进度；原阶段没有可用总量时留空轨道，不拿下载的满进度冒充
                     if (_task.PausedFromStage == DownloadTaskStage.Downloading)
+                    {
                         percent = TransferProgressDisplay.Percent(received, _task.Total);
+                        hasPercent = true;
+                    }
                     else if (_task.PausedFromStage == DownloadTaskStage.Unpacking && unpack?.TotalBytes is > 0)
+                    {
                         percent = TransferProgressDisplay.Percent(unpack.BytesExtracted, unpack.TotalBytes.Value);
-                    else
-                        showProgress = false;
+                        hasPercent = true;
+                    }
                     break;
                 case DownloadTaskStage.Completed:
                     percent = 100;
@@ -593,10 +571,9 @@ public sealed class DownloadProgressDialog : UserControl
                 : message;
             _progressBar.IsIndeterminate = indeterminate && !interrupting;
             _progressBar.Value = percent;
-            _progressBar.Visibility = showProgress ? Visibility.Visible : Visibility.Collapsed;
-            _rightText.Text = right;
-            _speedText.Text = interrupting ? string.Empty : rate;
-            _speedText.Visibility = _speedText.Text.Length == 0 ? Visibility.Collapsed : Visibility.Visible;
+            var percentText = hasPercent ? $"{percent:F1}%" : string.Empty;
+            _rightText.Text = interrupting ? string.Empty
+                : rate.Length > 0 && percentText.Length > 0 ? $"{rate} · {percentText}" : rate + percentText;
             _detailText.Text = detail;
             _detailText.Visibility = detail.Length == 0 ? Visibility.Collapsed : Visibility.Visible;
             ToolTipService.SetToolTip(_detailText, detail);

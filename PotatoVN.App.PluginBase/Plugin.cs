@@ -93,6 +93,7 @@ namespace PotatoVN.App.PluginBase
         {
             if (cts.IsCancellationRequested) return;
             CancelShutdownCountdown(); // 卸载/停用时挂着的关机倒计时必须作废，避免插件没了机器还被关
+            _hostApi.InvokeOnMainThread(() => _sidebarProgressTimer?.Stop()); // 计时器不停会一直持有插件程序集
             DownloadManager?.Shutdown(); // 先停下载：后台任务持有程序集与文件句柄，不停会导致 DLL 删除失败
             if (_pushService is not null) await _pushService.StopAsync();
             if (DownloadManager is not null) await DownloadManager.ShutdownAsync(cts);

@@ -108,6 +108,15 @@ public class DownloadTask
     /// <summary>下载字节进度：向下截到一位小数，任务完成前保留 100% 给真正的终态。</summary>
     public double ProgressPercent => TransferProgressDisplay.Percent(Received, Total, Stage == DownloadTaskStage.Completed);
 
+    /// <summary>当前阶段可度量的进度（0–100）；阶段没有可用总量（排队/校验/入库/未知解压总量/已结束）时为 null。</summary>
+    public double? StagePercent => Stage switch
+    {
+        DownloadTaskStage.Downloading => TransferProgressDisplay.Percent(Received, Total),
+        DownloadTaskStage.Unpacking when UnpackProgress is { TotalBytes: > 0 } unpack =>
+            TransferProgressDisplay.Percent(unpack.BytesExtracted, unpack.TotalBytes.Value),
+        _ => null,
+    };
+
     public bool IsActive => Stage is DownloadTaskStage.Pending or DownloadTaskStage.Downloading
         or DownloadTaskStage.Verifying or DownloadTaskStage.Unpacking or DownloadTaskStage.Importing;
 
